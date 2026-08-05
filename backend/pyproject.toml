@@ -1,0 +1,49 @@
+[project]
+name = "theatre-social-backend"
+version = "0.1.0"
+description = "FastAPI backend for theatre-social."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn[standard]>=0.32.0,<1.0.0",
+  "sqlalchemy>=2.0.35,<3.0.0",
+  # SQLAlchemy's own dependency marker for greenlet checks
+  # platform_machine == "aarch64" (Linux) but not "arm64" (macOS Apple
+  # Silicon), so it's silently skipped there. Depend on it directly so
+  # async sessions work on every supported platform.
+  "greenlet>=3.1.0,<4.0.0",
+  "asyncpg>=0.30.0,<1.0.0",
+  "alembic>=1.13.3,<2.0.0",
+  "pydantic>=2.9.0,<3.0.0",
+  "pydantic-settings>=2.5.0,<3.0.0",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.7.0,<1.0.0",
+  "pytest>=8.3.0,<9.0.0",
+  "pytest-asyncio>=0.24.0,<1.0.0",
+  "httpx>=0.27.0,<1.0.0",
+]
+
+# This is an application, not a library: don't try to build/install it as a
+# distributable package, just manage its dependency environment.
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# B008: FastAPI's `Depends(...)` as an argument default is the framework's
+# idiomatic dependency-injection pattern, not a real "mutable default" bug.
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

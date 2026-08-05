@@ -1,0 +1,37 @@
+# --- Environment files ---
+.env
+.env.local
+.env.*.local
+!*.env.example
+
+# --- Node / frontend ---
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/coverage/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+frontend/.pnpm-store/
+frontend/pnpm-debug.log*
+
+# --- Python / backend ---
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/.venv/
+backend/venv/
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/.mypy_cache/
+backend/htmlcov/
+backend/.coverage
+backend/*.egg-info/
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Containers ---
+*.pid
