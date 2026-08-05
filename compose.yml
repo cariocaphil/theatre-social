@@ -1,0 +1,102 @@
+# OCI-compatible Compose file. Works with:
+#   podman compose up --build
+#   podman-compose up --build   (standalone podman-compose, if installed instead)
+#   docker compose up --build
+#
+# No privileged mode, no root containers, no host networking, no Docker
+# socket access. Postgres data uses a named volume (avoids UID/GID mapping
+# issues with rootless Podman entirely). Source bind mounts for the frontend
+# and backend use :Z, which rootless Podman on SELinux hosts (e.g.
+# Fedora/RHEL) needs to relabel the mount for container access; Docker and
+# non-SELinux hosts simply ignore this flag, so it is safe everywhere.
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-theatre_social}
+      POSTGRES_USER: ${POSTGRES_USER:-theatre_social}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-theatre_social_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER:-theatre_social} -d $${POSTGRES_DB:-theatre_social}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://theatre_social:theatre_social_dev_password@postgres:5432/theatre_social}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    volumes:
+      # Live-reload source from the host; the named volume below shadows
+      # /app/.venv so the dependencies installed at image build time survive
+      # the bind mount instead of being hidden by the (dependency-less) host
+      # directory.
+      - ./backend:/app:Z
+      - backend_venv:/app/.venv
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; import sys; sys.exit(0 if u.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      INTERNAL_API_URL: ${INTERNAL_API_URL:-http://backend:8000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    volumes:
+      # Same shadow-volume trick as the backend, but for node_modules.
+      - ./frontend:/app:Z
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  backend_venv:
+  frontend_node_modules:
