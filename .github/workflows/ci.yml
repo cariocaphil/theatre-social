@@ -24,9 +24,14 @@ jobs:
 
       # Installs pnpm first so setup-node's pnpm cache step (below) can find it
       # on PATH. Version comes from the "packageManager" field in package.json,
-      # so it never drifts from what's used locally.
+      # so it never drifts from what's used locally. `package_json_file` must be
+      # set explicitly: the action resolves it relative to the repository root
+      # regardless of `defaults.run.working-directory` (which only applies to
+      # `run:` steps), and this repo has no root-level package.json.
       - name: Install pnpm
         uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
