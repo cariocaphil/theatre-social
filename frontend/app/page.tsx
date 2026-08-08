@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { HealthStatus } from "@/components/health-status";
 import { fetchHealth } from "@/lib/api";
 
@@ -15,6 +16,9 @@ export default async function HomePage() {
         Monorepo foundation: Next.js frontend + FastAPI backend + PostgreSQL.
       </p>
       <HealthStatus initialResult={initialResult} />
+      <p style={{ marginTop: "1.5rem" }}>
+        <Link href="/productions">Browse the production catalogue &rarr;</Link>
+      </p>
     </main>
   );
 }

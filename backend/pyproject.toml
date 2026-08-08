@@ -46,4 +46,10 @@ known-first-party = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# The app's async engine (app/db/session.py) is a process-lifetime
+# singleton; asyncpg connections are bound to the event loop they were
+# created on, so every async test/fixture must share one event loop for
+# the whole session instead of pytest-asyncio's per-function default.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]

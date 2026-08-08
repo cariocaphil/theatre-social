@@ -4,10 +4,14 @@ Monorepo foundation for Theatre Social: a Next.js (TypeScript, App Router) front
 FastAPI (Python, async SQLAlchemy 2 + `asyncpg`) backend, and PostgreSQL, orchestrated
 with an OCI-compatible Compose file that works with rootless Podman or Docker.
 
-This repository currently contains only the **foundation**: project scaffolding, a
-`/health` endpoint that verifies database connectivity end-to-end, and the container /
-migration / testing setup needed to build real features on top of it. There is no
-authentication, user data, or domain logic yet.
+Phase 1 built the **foundation**: project scaffolding, a `/health` endpoint that
+verifies database connectivity end-to-end, and the container / migration / testing
+setup needed to build real features on top of it.
+
+Phase 2 (v0.1) adds the first real domain feature: a read-only **Production
+catalogue** (see [Production Catalogue (v0.1)](#production-catalogue-v01) below).
+There is still no authentication, user accounts, reviews, ratings, or diary
+functionality.
 
 ```
 theatre-social/
@@ -82,7 +86,9 @@ To run in the background: `podman compose up --build -d`.
 
 - **Frontend:** http://localhost:3000 — shows API reachability and database status,
   fetched server-side on load, with a "Check again" button for a client-side re-check.
+- **Production catalogue:** http://localhost:3000/productions
 - **Backend health check:** http://localhost:8000/health
+- **Production catalogue API:** http://localhost:8000/api/v1/productions
 - **Swagger UI:** http://localhost:8000/docs
 - **ReDoc:** http://localhost:8000/redoc
 - **OpenAPI schema:** http://localhost:8000/openapi.json
@@ -102,6 +108,224 @@ interchangeable:
 Using `localhost` inside a container would point at that container itself, not the
 `backend` container — this is a common source of confusion, so the two URLs are kept
 as separate, explicitly-named env vars throughout.
+
+## Production Catalogue (v0.1)
+
+> Production is the primary catalogue entity. Users will eventually log Productions.
+
+A **Production** represents a specific staging that users will eventually be able to
+log, review, rate, or discuss — e.g. a run of "Hamlet" at a specific theatre, a
+stand-up set, an improv night, or a devised theatre piece.
+
+### Why no separate Work / Venue entities yet
+
+> Work and Venue are intentionally not separate entities in v0.1. Their values are
+> stored as optional Production metadata until concrete product requirements justify
+> normalization.
+
+Modeling Works and Venues as their own tables would require deciding — before any
+real usage data exists — whether Works need their own pages, whether Venues need
+their own pages, how adaptations should be grouped under a Work, how touring
+Productions relate to multiple Venues, and whether a Venue eventually belongs to a
+Production or to an individual performance. v0.1 avoids answering those questions
+prematurely by storing `work_title`, `venue_name`, `creator_names`, `company_name`,
+and `director_name` as plain optional text columns directly on `productions`.
+
+### Data model
+
+`Production` inherits `id` (UUID, generated app-side), `created_at`, and `updated_at`
+(both DB-generated via `server_default=func.now()`) from a shared `UUIDAuditBase` in
+`app/db/base.py` — no per-model primary-key or timestamp logic is duplicated.
+
+| Field | Required | Notes |
+|---|---|---|
+| `title` | Yes | Must not be blank. |
+| `slug` | Yes (at persistence) | Auto-generated from `title` if omitted; unique at the database level. |
+| `description` | No | Free text. |
+| `work_title` | No | Underlying source-material title, if any. |
+| `creator_names` | No | Free-text attribution (playwright, deviser, ensemble, ...). |
+| `company_name` | No | Producing/performing company, plain text. |
+| `director_name` | No | Plain text. |
+| `venue_name` | No | Plain text. |
+| `city` / `country_code` | No | `country_code` must be a 2-letter code when supplied. |
+| `premiere_date` / `closing_date` | No | `closing_date` must be ≥ `premiere_date` when both are supplied. |
+
+There is no status field, and lifecycle status (e.g. "running" / "closed") is never
+inferred from dates in the database model — that logic, if ever needed, belongs in the
+API or frontend layer, not persisted state.
+
+### Slugs
+
+> Slugs are stable public URL identifiers. Changing a Production title does not
+> automatically change its slug.
+
+- Omit `slug` on create and the backend generates one from `title` (lowercased,
+  ASCII-transliterated where possible, non-alphanumeric runs collapsed to single
+  hyphens).
+- On collision, a deterministic numeric suffix is appended: `hamlet`, `hamlet-2`,
+  `hamlet-3`, ... — never a random hash.
+- The database's unique index on `slug` is the final source of truth for concurrency
+  safety; an explicit duplicate slug on create/update returns `409 Conflict`.
+- Updating `title` never touches `slug`. `slug` only changes when explicitly included
+  in a `PATCH` request.
+
+### REST API
+
+```text
+GET    /api/v1/productions            List (search/filter/paginate)
+POST   /api/v1/productions            Create
+GET    /api/v1/productions/{id}       Get by UUID
+PATCH  /api/v1/productions/{id}       Partial update
+DELETE /api/v1/productions/{id}       Delete
+GET    /api/v1/productions/slug/{slug} Get by slug
+```
+
+`GET /api/v1/productions/slug/{slug}` is registered before `GET /api/v1/productions/{id}`
+in `app/api/routes/productions.py`; since the two paths have a different number of
+path segments, there is no real ambiguity, but the ordering is kept explicit for
+clarity. `{id}` is typed as a UUID, so a malformed ID (including the literal string
+`slug` with no further segment) fails FastAPI's path validation with `422`, not `404`.
+
+Status codes: `200` (reads/updates), `201` (create), `204` (delete), `404` (missing
+Production), `409` (duplicate explicit slug), `422` (validation errors, including
+blank titles, invalid `country_code`, invalid date ranges, and malformed UUIDs).
+
+#### List filtering parameters
+
+`search`, `work_title`, `company_name`, `director_name`, `venue_name`, `city`,
+`country_code`, `from_date`, `to_date`, `limit` (1–100, default 20), `offset` (≥ 0,
+default 0).
+
+- `search` matches (case-insensitively, via `ILIKE`) `title`, `work_title`,
+  `creator_names`, `company_name`, `director_name`, `venue_name`, and `city`.
+- `work_title`, `company_name`, `director_name`, `venue_name`, `city` are individual
+  case-insensitive partial-match filters.
+- `country_code` is an exact, case-insensitive match.
+
+#### Date filtering semantics
+
+A Production matches a date filter based on overlap between its known
+`[premiere_date, closing_date]` range and the requested `[from_date, to_date]` range:
+
+- **No `from_date`/`to_date` supplied:** no date filtering at all (Productions with
+  missing dates are included normally).
+- **A Production with no `premiere_date`:** excluded whenever `from_date` and/or
+  `to_date` is supplied — its date range is entirely unknown, so it can't be said to
+  overlap anything.
+- **A Production with no `closing_date`** (but a known `premiere_date`): treated as
+  an open-ended/ongoing run, so it always satisfies the `from_date` bound.
+- **Only `from_date` supplied:** matches if `premiere_date` is known and the run
+  hasn't already closed before `from_date` (`closing_date IS NULL OR closing_date >= from_date`).
+- **Only `to_date` supplied:** matches if `premiere_date` is known and on or before
+  `to_date`.
+- **Both supplied:** both conditions above apply together (standard interval overlap).
+
+#### Pagination and ordering
+
+```json
+{ "items": [], "total": 0, "limit": 20, "offset": 0 }
+```
+
+Results are always ordered `title ASC, id ASC` — the `id` tiebreaker keeps ordering
+deterministic even when multiple Productions share the same title.
+
+### Example requests
+
+Minimal Production:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/productions \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Impro Night Berlin"}'
+```
+
+Production with full metadata (explicit slug):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/productions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "title": "Hamlet",
+        "slug": "hamlet-schaubuehne-berlin",
+        "work_title": "Hamlet",
+        "creator_names": "William Shakespeare",
+        "company_name": "Example Ensemble",
+        "director_name": "Sample Director",
+        "venue_name": "Example Theatre",
+        "city": "Berlin",
+        "country_code": "DE",
+        "premiere_date": "2026-03-10",
+        "closing_date": "2026-05-18"
+      }'
+```
+
+Stand-up Production without Work or Venue metadata:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/productions \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Solo Stand-Up Hour", "creator_names": "Sample Comedian"}'
+```
+
+Update a Production:
+
+```bash
+curl -X PATCH http://localhost:8000/api/v1/productions/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"city": "Munich"}'
+```
+
+Clear an optional field (explicit `null`):
+
+```bash
+curl -X PATCH http://localhost:8000/api/v1/productions/<id> \
+  -H "Content-Type: application/json" \
+  -d '{"venue_name": null}'
+```
+
+Filter Productions (German productions premiering in 2026 matching "hamlet"):
+
+```bash
+curl "http://localhost:8000/api/v1/productions?search=hamlet&country_code=DE&from_date=2026-01-01&to_date=2026-12-31"
+```
+
+Retrieve by slug:
+
+```bash
+curl http://localhost:8000/api/v1/productions/slug/hamlet-schaubuehne-berlin
+```
+
+### Frontend routes
+
+- `/productions` — catalogue list (title, available metadata, links to detail pages).
+  Shows a loading state (`app/productions/loading.tsx`), an inline error state if the
+  API call fails, and an empty state if the catalogue has no Productions yet.
+- `/productions/[slug]` — Production detail page. Renders a proper 404 (via Next.js
+  `notFound()` / `not-found.tsx`) for an unknown slug. Optional fields with no value
+  are simply omitted — there are no empty `Director:` / `Venue:` / `City:` labels.
+
+Both pages fetch server-side via `INTERNAL_API_URL` (same pattern as the Phase 1 home
+page), and there is no create/edit/delete UI — the catalogue is read-only in v0.1. A
+basic filter UI was intentionally omitted (Phase 1 established no filter pattern to
+follow); the backend filtering/search parameters above are fully implemented and can
+be exercised directly against the API.
+
+### Known limitations
+
+- **`notFound()` and HTTP status codes:** because `/productions/loading.tsx` puts the
+  `[slug]` page behind a streaming Suspense boundary, Next.js sends the `200` status
+  before the `notFound()` result is known, so `/productions/<unknown-slug>` renders the
+  correct "Production not found" page but reports HTTP `200` rather than `404` (Next.js
+  still adds a `noindex` meta tag, so this does not affect search-engine indexing).
+  This is a [documented Next.js App Router behavior](https://nextjs.org/docs/app/api-reference/file-conventions/loading#instant-loading-states),
+  not specific to this codebase.
+- **Slug auto-generation under true concurrent writes:** two simultaneous requests
+  auto-generating a slug from the same title could both compute the same "next free"
+  suffix before either commits; the database's unique constraint is the final
+  safety net, so in that rare race one request would receive a `409` instead of
+  silently retrying with a new suffix.
+- **Backend hot-reload on macOS bind mounts** (pre-existing Phase 1 limitation, see
+  above) also applies to the new Production code.
 
 ## Stopping, rebuilding, logs
 
@@ -158,8 +382,22 @@ podman compose exec backend uv run alembic downgrade -1
 podman compose exec backend uv run alembic current
 ```
 
-An initial, empty migration (`backend/alembic/versions/0001_initial.py`) is included so
-the migration chain has a known starting point. There are no domain tables yet.
+An initial, empty migration (`backend/alembic/versions/0001_initial.py`) establishes
+the Alembic baseline. `backend/alembic/versions/0002_create_productions_table.py`
+creates the `productions` table (see [Production Catalogue (v0.1)](#production-catalogue-v01)).
+Both are reversible (`alembic downgrade -1` cleanly undoes either one).
+
+### Seed data
+
+Once migrations are applied, seed the Production catalogue with sample data:
+
+```bash
+podman compose exec backend uv run python -m app.db.seed
+# or: docker compose exec backend uv run python -m app.db.seed
+```
+
+The seed script is idempotent: it looks up each Production by its stable `slug`
+before inserting, so running it again never creates duplicates.
 
 ## Local (non-container) development
 
@@ -213,8 +451,17 @@ running containers).
 ```bash
 uv run ruff check .           # lint
 uv run ruff format --check .  # format check (use `ruff format .` to fix)
-uv run pytest                 # tests (health success / db-unavailable / app startup)
+uv run pytest                 # tests (health, app startup, Production catalogue)
 ```
+
+The Production catalogue tests exercise real SQL (case-insensitive search, unique
+slugs, ordering) against an actual PostgreSQL database rather than a mocked session —
+consistent with the project's "async SQLAlchemy, no mocking layer" approach. This
+means `pytest` requires a reachable database at `DATABASE_URL` (e.g.
+`podman compose up -d postgres`, with `backend/.env` pointing at `localhost:5432` as
+usual for host-side runs). The test suite creates the schema automatically if missing
+and truncates the `productions` table between tests for isolation, so it's safe to run
+repeatedly and does not require running migrations first.
 
 ### Frontend (from `frontend/`)
 
