@@ -13,6 +13,11 @@ catalogue** (see [Production Catalogue (v0.1)](#production-catalogue-v01) below)
 There is still no authentication, user accounts, reviews, ratings, or diary
 functionality.
 
+Phase 3 adds **Continuous Integration**: every push and pull request to `main` is
+automatically linted, type-checked, tested, and built on GitHub Actions (see
+[Continuous Integration](#continuous-integration) below). This phase is CI only —
+there is no deployment, image publishing, or external SaaS integration.
+
 ```
 theatre-social/
 ├── frontend/     Next.js (TypeScript, App Router), pnpm
@@ -471,6 +476,69 @@ pnpm format:check     # Prettier check (use `pnpm format` to fix)
 pnpm test             # Vitest + React Testing Library
 pnpm build            # production build
 ```
+
+## Continuous Integration
+
+Every push and pull request targeting `main` runs `.github/workflows/ci.yml` on GitHub
+Actions. It has two independent, parallel jobs — nothing here starts Postgres via
+Compose or spins up the full container stack; each job only brings up what it needs.
+
+### Frontend job
+
+Runs from `frontend/`, using pnpm (via `pnpm/action-setup`, version read from the
+`packageManager` field so it never drifts from local) and Node.js 20.20.2 (matching
+the `volta` pin), with pnpm's store cached between runs:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm lint          # ESLint
+pnpm typecheck      # tsc --noEmit
+pnpm test           # Vitest + React Testing Library
+pnpm build          # production build (NEXT_TELEMETRY_DISABLED=1, placeholder API URLs)
+```
+
+`pnpm typecheck` is a new script (`tsc --noEmit`, using the existing `strict: true`
+`tsconfig.json`) added specifically to give CI a dedicated type-checking step; nothing
+else about the frontend tooling changed. The build step sets `NEXT_PUBLIC_API_URL` and
+`INTERNAL_API_URL` to harmless `localhost` placeholders — the app's dynamic routes
+(`/`, `/productions`, `/productions/[slug]`) fetch data at request time, not at build
+time, so no backend needs to be reachable for `pnpm build` to succeed.
+
+### Backend job
+
+Runs from `backend/`, using `uv` (via `astral-sh/setup-uv`, with its dependency cache
+keyed on `backend/uv.lock`) and Python 3.12 (matching the `Dockerfile` and
+`requires-python`). A `postgres:16` service container is started by GitHub Actions
+itself (not Compose) with an explicit `pg_isready` health check; Actions blocks the
+job's steps until it reports healthy, so no extra "wait for Postgres" step is needed.
+The service is only reachable for the lifetime of the job and uses CI-only,
+throw-away credentials — it has nothing to do with local development credentials:
+
+```bash
+uv sync --frozen
+uv run ruff check .            # lint
+uv run ruff format --check .   # format check
+uv run alembic upgrade head    # verify migrations against a fresh DB
+uv run pytest                  # tests
+```
+
+`DATABASE_URL` is set for the job to
+`postgresql+asyncpg://postgres:postgres@localhost:5432/theatre_test` — `localhost`
+because the service container's port is published back to the runner itself. Running
+`alembic upgrade head` against this brand-new database (before `pytest`) proves the
+migration chain builds the schema from empty; it's a genuine extra check, since the
+test suite's own fixtures create the schema via `Base.metadata.create_all` and don't
+strictly depend on the migrations having been run first. No backend type checker
+(mypy/pyright) is configured in `pyproject.toml`, so none was added — the spec calls
+for reusing existing tooling and only introducing something new where a check would
+otherwise be impossible.
+
+### Reproducing CI locally
+
+The commands above are exactly what CI runs — no CI-only scripts or wrapper tooling
+were introduced. To reproduce the backend job locally, point `DATABASE_URL` at a
+disposable database (e.g. `podman compose up -d postgres`, then create a scratch
+database) before running the `uv run` commands.
 
 ## Troubleshooting rootless Podman
 

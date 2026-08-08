@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs for the same branch/PR so pushes don't queue up stale CI runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Installs pnpm first so setup-node's pnpm cache step (below) can find it
+      # on PATH. Version comes from the "packageManager" field in package.json,
+      # so it never drifts from what's used locally.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20.20.2"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Type check
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      # Placeholder values only: nothing in this job talks to a real backend.
+      # NEXT_PUBLIC_API_URL is inlined into the client bundle at build time,
+      # so it must be set even though it's never called during the build.
+      - name: Build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+          INTERNAL_API_URL: http://localhost:8000
+        run: pnpm build
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: theatre_test
+        ports:
+          - 5432:5432
+        # GitHub Actions blocks job steps until this reports healthy, so no
+        # separate "wait for postgres" step is needed.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # CI-only database, isolated from local/dev credentials and reachable at
+      # "localhost" because the service container's port is published to the runner host.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/theatre_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format check (ruff format)
+        run: uv run ruff format --check .
+
+      # Proves the migration chain actually builds the schema from empty,
+      # independent of the test suite's own create_all-based fixture.
+      - name: Run migrations
+        run: uv run alembic upgrade head
+
+      - name: Test
+        run: uv run pytest
