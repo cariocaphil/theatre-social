@@ -3,10 +3,14 @@
 from collections.abc import AsyncGenerator
 
 import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
-from app.db.session import get_db
+from app.db.base import Base
+from app.db.session import engine, get_db
 from app.main import app
+from app.models import Production  # noqa: F401 - ensures Base.metadata includes it
 
 
 @pytest.fixture
@@ -28,3 +32,28 @@ def client_factory():
 def _reset_overrides() -> AsyncGenerator[None, None]:
     yield
     app.dependency_overrides.pop(get_db, None)
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _prepare_schema() -> AsyncGenerator[None, None]:
+    """Ensure the schema exists before Production tests run.
+
+    Production tests exercise real SQL (ILIKE, uniqueness, ordering), so
+    they run against a real PostgreSQL database rather than a mocked
+    session, consistent with the project's async-SQLAlchemy-only
+    conventions. This requires a reachable database at `DATABASE_URL` (see
+    README: "Backend tests requiring a database").
+    """
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_productions_table() -> AsyncGenerator[None, None]:
+    """Truncate the productions table before every test for isolation."""
+
+    async with engine.begin() as connection:
+        await connection.execute(text("TRUNCATE TABLE productions"))
+    yield
