@@ -1,3 +1,4 @@
+import { LogProductionAction } from "@/components/log-production-action";
 import type { ProductionDetail as ProductionDetailData } from "@/lib/productions";
 
 interface ProductionDetailProps {
@@ -17,6 +18,10 @@ export function ProductionDetail({ production }: ProductionDetailProps) {
   return (
     <article>
       <h1>{production.title}</h1>
+
+      <div style={{ marginTop: "1rem" }}>
+        <LogProductionAction productionId={production.id} productionTitle={production.title} />
+      </div>
 
       {production.description && <p style={{ marginTop: "1rem" }}>{production.description}</p>}
 

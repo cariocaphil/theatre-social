@@ -37,6 +37,17 @@ class InvalidDateRangeError(Exception):
     """Raised when closing_date would end up earlier than premiere_date."""
 
 
+class ProductionDeletionRestrictedError(Exception):
+    """Raised when a Production can't be deleted because other rows reference it.
+
+    Deliberately doesn't name a specific referencing table: this module
+    stays decoupled from e.g. `diary_entries` (Phase 5's `ON DELETE
+    RESTRICT` foreign key), it just translates *any* such database-level
+    restriction into a controlled API error instead of a raw
+    `IntegrityError`.
+    """
+
+
 def _check_date_range(premiere_date: date | None, closing_date: date | None) -> None:
     if premiere_date is not None and closing_date is not None and closing_date < premiere_date:
         raise InvalidDateRangeError("closing_date must be on or after premiere_date")
@@ -256,4 +267,8 @@ async def update_production(
 async def delete_production(session: AsyncSession, production_id: uuid.UUID) -> None:
     production = await get_production_by_id(session, production_id)
     await session.delete(production)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ProductionDeletionRestrictedError(str(production_id)) from exc
