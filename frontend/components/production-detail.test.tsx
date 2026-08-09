@@ -1,7 +1,15 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AuthProvider } from "./auth-provider";
 import { ProductionDetail } from "./production-detail";
 import type { ProductionDetail as ProductionDetailData } from "@/lib/productions";
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 function makeDetail(overrides: Partial<ProductionDetailData> = {}): ProductionDetailData {
   return {
@@ -25,7 +33,16 @@ function makeDetail(overrides: Partial<ProductionDetailData> = {}): ProductionDe
 }
 
 describe("ProductionDetail", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("renders every field when fully populated", () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ detail: "Not authenticated" }, 401)),
+    );
+
     const production = makeDetail({
       title: "Hamlet",
       description: "A staging of Shakespeare's tragedy.",
@@ -40,7 +57,11 @@ describe("ProductionDetail", () => {
       closing_date: "2026-05-18",
     });
 
-    render(<ProductionDetail production={production} />);
+    render(
+      <AuthProvider>
+        <ProductionDetail production={production} />
+      </AuthProvider>,
+    );
 
     expect(screen.getByRole("heading", { name: "Hamlet" })).toBeInTheDocument();
     expect(screen.getByText("A staging of Shakespeare's tragedy.")).toBeInTheDocument();
@@ -55,9 +76,18 @@ describe("ProductionDetail", () => {
   });
 
   it("renders correctly with every optional field missing, without empty labels", () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ detail: "Not authenticated" }, 401)),
+    );
+
     const production = makeDetail({ title: "Impro Night Berlin" });
 
-    render(<ProductionDetail production={production} />);
+    render(
+      <AuthProvider>
+        <ProductionDetail production={production} />
+      </AuthProvider>,
+    );
 
     expect(screen.getByRole("heading", { name: "Impro Night Berlin" })).toBeInTheDocument();
     expect(screen.queryByText("Based on")).not.toBeInTheDocument();

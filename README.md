@@ -20,8 +20,13 @@ there is no deployment, image publishing, or external SaaS integration.
 
 Phase 4 adds minimal **Users & Authentication**: registration, login, logout, and a
 `/me` account summary, backed by a server-side session stored in an HTTP-only cookie
-(see [Users & Authentication](#users--authentication) below). There is still no
-Production logging, diary, ratings, reviews, follows, or public profiles.
+(see [Users & Authentication](#users--authentication) below).
+
+Phase 5 adds **Production Logging & Diary**: a signed-in user can log that they
+attended a Production — an attendance record (`DiaryEntry`) with an optional
+half-star rating and text review, viewable/editable at `/diary` (see [Production
+Logging & Diary](#production-logging--diary) below). There is still no likes,
+follows, comments, feeds, aggregate ratings, or public profiles.
 
 ```
 theatre-social/
@@ -494,6 +499,138 @@ curl -i -b cookies.txt -X POST http://localhost:8000/api/v1/auth/logout
 - No scheduled cleanup of expired sessions; rows are removed opportunistically when
   encountered, which is acceptable at this scale but would need a periodic job later.
 
+## Production Logging & Diary
+
+Phase 5 adds the first core user activity: a signed-in user can log that they
+attended a Production. A `DiaryEntry` is a record of one specific attendance — a
+user may log the same Production multiple times (e.g. seeing the same run twice,
+or a revival years later), and each attendance is its own row. There is
+deliberately no unique constraint on `(user_id, production_id)`, and no upsert
+behavior: logging a Production a second time always creates a new, independent
+entry rather than overwriting the first.
+
+```
+Production = the thing that was seen
+DiaryEntry = this user's record of seeing it (attendance + optional rating/review)
+```
+
+There are still no likes, comments, follows, activity feeds, public diary pages,
+aggregate/average ratings, tags, lists, or viewing statistics — those are
+explicitly out of scope until a later phase needs them.
+
+### Data model
+
+- **`diary_entries`** — `id` (UUID), `user_id` (FK → `users.id`, `ON DELETE
+  CASCADE`), `production_id` (FK → `productions.id`, `ON DELETE RESTRICT`),
+  `watched_at` (date, required, rejects future dates), `rating` (optional
+  `SMALLINT`, 1-10 half-star units), `review` (optional `Text`, max 4000
+  characters), `created_at`, `updated_at`.
+- **Cascade behavior is intentionally asymmetric**: deleting a User deletes their
+  diary history with it (same convention as `sessions.user_id`), but a Production
+  with diary history **cannot** be deleted (`ON DELETE RESTRICT` — attempting to
+  do so returns `409 Conflict`) so that a catalogue cleanup can never silently
+  erase users' attendance history. Archiving/soft-deleting such a Production is
+  left to a future phase.
+- **Rating representation**: the public API and frontend always use a
+  Letterboxd-style **0.5-5.0 scale in 0.5 increments**, but the database stores
+  it as an integer **1-10 half-star count** (`rating = api_value * 2`) guarded by
+  a `CHECK (rating IS NULL OR rating BETWEEN 1 AND 10)` constraint — this avoids
+  storing an arbitrary float for what is really a 10-value discrete domain.
+  Conversion is centralized in `backend/app/core/ratings.py` and never
+  duplicated in routes or the frontend, which only ever sees 0.5-5.0.
+- **Indexes**: a composite `(user_id, watched_at, created_at)` index backs the
+  primary diary query (current user's entries, newest attendance first, with
+  `created_at` then `id` as deterministic tiebreakers); `production_id` also has
+  its own index, consistent with indexing foreign-key columns.
+
+### Endpoints
+
+| Method | Path                     | Behavior                                                       |
+|--------|--------------------------|------------------------------------------------------------------|
+| POST   | `/api/v1/diary`          | Create a diary entry for the current user (`404` if the Production doesn't exist) |
+| GET    | `/api/v1/diary`          | List the current user's diary, paginated, `watched_at DESC, created_at DESC, id DESC` |
+| GET    | `/api/v1/diary/{id}`     | Get one of the current user's diary entries                     |
+| PATCH  | `/api/v1/diary/{id}`     | Partially update `watched_at`/`rating`/`review` (`production_id` is immutable) |
+| DELETE | `/api/v1/diary/{id}`     | Delete one of the current user's diary entries                  |
+
+All five require authentication (the same `get_current_user` session dependency
+introduced in Phase 4) and derive `user_id` from the session — never from the
+request body, a query parameter, or the URL. `GET /api/v1/diary` reuses the
+existing generic `Page[T]` pagination envelope and embeds each entry's
+`ProductionSummary` (the same schema the catalogue list already returns) so the
+frontend never needs one extra request per entry.
+
+An entry belonging to another user is indistinguishable from a nonexistent one:
+both return `404`, not `403` — consistent with this project's existing
+preference (see the auth system's single generic login error) for not revealing
+information about resources a caller can't access.
+
+### Frontend
+
+- **Production detail page** — a prominent **"Log this production"** action.
+  Unauthenticated visitors see a "Log in to log this production" prompt (reusing
+  `useAuth`, the same session state Phase 4 established — no separate auth
+  mechanism), rather than the button.
+- **Log/review dialog** (`components/log-dialog.tsx`) — reused for both
+  creating and editing an entry. Built on the native `<dialog>` element
+  (`showModal()`), which provides focus trapping, Escape-to-close, and focus
+  restoration without a UI library. Fields: date attended (defaults to today,
+  browser `max` attribute plus authoritative backend validation), an optional
+  half-star rating (`components/star-rating.tsx` — native radio inputs styled as
+  stars, clearable via a separate "Clear rating" button since no rating value
+  itself means "none"), and an optional review textarea. The only required
+  field is the date; rating and review are enhancements to the log, not
+  requirements.
+- **`/diary`** — the signed-in user's chronological theatre history, newest
+  attendance first, each entry showing date / production title (linked) /
+  venue / rating (`★★★★½`-style) / review. Edit reopens the same dialog
+  pre-filled; delete requires a confirmation click. Added to the nav for
+  signed-in users.
+- **Mutations without a reload**: both the production page and `/diary` update
+  their own local React state from the mutation's response (`onSaved`/`onEdit`/
+  `onDelete` callbacks) rather than using `router.refresh()` — consistent with
+  the fact that both pages already render this data via client-side state
+  (`useAuth`-gated Client Components, the same pattern `/me` established in
+  Phase 4), not a Server Component fetch.
+- **`frontend/lib/diary.ts`** extends the existing typed API-client pattern
+  (`{ok, ...}` results, `credentials: "include"`) alongside `lib/auth.ts` and
+  `lib/productions.ts`.
+
+### Example requests
+
+Log a production (reusing a cookie jar from a prior register/login):
+
+```bash
+curl -i -b cookies.txt -X POST http://localhost:8000/api/v1/diary \
+  -H "Content-Type: application/json" \
+  -d '{"production_id": "<production-uuid>", "watched_at": "2026-03-14", "rating": 4.5, "review": "A remarkable production."}'
+```
+
+List the current user's diary:
+
+```bash
+curl -s -b cookies.txt http://localhost:8000/api/v1/diary
+```
+
+Clear a rating/review on an existing entry:
+
+```bash
+curl -i -b cookies.txt -X PATCH http://localhost:8000/api/v1/diary/<entry-uuid> \
+  -H "Content-Type: application/json" \
+  -d '{"rating": null, "review": null}'
+```
+
+### Known limitations
+
+- No aggregate/average ratings anywhere (Production catalogue or diary) — each
+  `DiaryEntry` is only ever shown in the context of its own user.
+- No pagination controls in the `/diary` UI yet — the API supports
+  `limit`/`offset`, but the frontend always requests the first page.
+- No spoiler handling, rich text, or review-length enforcement in the frontend
+  beyond a `maxLength` attribute and a character counter — the backend's 4000
+  character limit (`MAX_REVIEW_LENGTH` in `app/schemas/diary.py`) is
+  authoritative.
+
 ## Stopping, rebuilding, logs
 
 ```bash
@@ -553,8 +690,9 @@ An initial, empty migration (`backend/alembic/versions/0001_initial.py`) establi
 the Alembic baseline. `0002_create_productions_table.py` creates the `productions`
 table (see [Production Catalogue (v0.1)](#production-catalogue-v01)).
 `0003_create_users_and_sessions_tables.py` creates the `users` and `sessions` tables
-(see [Users & Authentication](#users--authentication)). All three are reversible
-(`alembic downgrade -1` cleanly undoes the most recent one).
+(see [Users & Authentication](#users--authentication)). `0004_create_diary_entries_table.py`
+creates the `diary_entries` table (see [Production Logging & Diary](#production-logging--diary)).
+All four are reversible (`alembic downgrade -1` cleanly undoes the most recent one).
 
 ### Seed data
 
@@ -620,18 +758,19 @@ running containers).
 ```bash
 uv run ruff check .           # lint
 uv run ruff format --check .  # format check (use `ruff format .` to fix)
-uv run pytest                 # tests (health, app startup, Production catalogue, auth)
+uv run pytest                 # tests (health, app startup, Production catalogue, auth, diary)
 ```
 
-The Production catalogue and authentication tests exercise real SQL (case-insensitive
-search, unique slugs/usernames/emails, ordering) against an actual PostgreSQL database
-rather than a mocked session — consistent with the project's "async SQLAlchemy, no
-mocking layer" approach. This means `pytest` requires a reachable database at
-`DATABASE_URL` (e.g. `podman compose up -d postgres`, with `backend/.env` pointing at
+The Production catalogue, authentication, and diary tests exercise real SQL
+(case-insensitive search, unique slugs/usernames/emails, ordering, foreign-key
+`RESTRICT` behavior) against an actual PostgreSQL database rather than a mocked
+session — consistent with the project's "async SQLAlchemy, no mocking layer"
+approach. This means `pytest` requires a reachable database at `DATABASE_URL`
+(e.g. `podman compose up -d postgres`, with `backend/.env` pointing at
 `localhost:5432` as usual for host-side runs). The test suite creates the schema
-automatically if missing and truncates the `productions`, `sessions`, and `users`
-tables between tests for isolation, so it's safe to run repeatedly and does not
-require running migrations first.
+automatically if missing and truncates the `productions`, `sessions`, `users`, and
+`diary_entries` tables between tests for isolation, so it's safe to run repeatedly
+and does not require running migrations first.
 
 ### Frontend (from `frontend/`)
 

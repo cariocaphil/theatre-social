@@ -16,8 +16,7 @@ export interface AuthUser {
 }
 
 export type AuthResult =
-  | { ok: true; data: AuthUser }
-  | { ok: false; status: number; error: string };
+  { ok: true; data: AuthUser } | { ok: false; status: number; error: string };
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 

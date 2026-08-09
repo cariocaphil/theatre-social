@@ -55,9 +55,7 @@ describe("LoginForm", () => {
 
     await user.click(screen.getByRole("button", { name: "Log in" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Email and password are required.",
-    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("Email and password are required.");
   });
 
   it("renders the API's generic authentication-failure error", async () => {

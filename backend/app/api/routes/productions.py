@@ -145,4 +145,9 @@ async def delete_production(
         await production_service.delete_production(session, production_id)
     except production_service.ProductionNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Production not found") from exc
+    except production_service.ProductionDeletionRestrictedError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="This production cannot be deleted while diary entries reference it",
+        ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
