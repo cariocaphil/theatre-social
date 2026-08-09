@@ -23,9 +23,26 @@ class Settings(BaseSettings):
     # Comma-separated list of allowed CORS origins, e.g. "http://localhost:3000".
     cors_origins: str = "http://localhost:3000"
 
+    # Name of the HTTP-only cookie holding the opaque session token.
+    session_cookie_name: str = "ts_session"
+    # How long a session (and its cookie) stays valid before `/auth/me` and
+    # other authenticated requests start treating it as expired.
+    session_lifetime_days: int = 30
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def session_cookie_secure(self) -> bool:
+        """Whether the session cookie should require HTTPS.
+
+        Derived from `environment` (already the project's convention for
+        environment-specific behavior) rather than a separate flag: `False`
+        for local HTTP development, `True` everywhere else.
+        """
+
+        return self.environment != "development"
 
 
 @lru_cache
