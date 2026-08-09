@@ -18,6 +18,11 @@ automatically linted, type-checked, tested, and built on GitHub Actions (see
 [Continuous Integration](#continuous-integration) below). This phase is CI only —
 there is no deployment, image publishing, or external SaaS integration.
 
+Phase 4 adds minimal **Users & Authentication**: registration, login, logout, and a
+`/me` account summary, backed by a server-side session stored in an HTTP-only cookie
+(see [Users & Authentication](#users--authentication) below). There is still no
+Production logging, diary, ratings, reviews, follows, or public profiles.
+
 ```
 theatre-social/
 ├── frontend/     Next.js (TypeScript, App Router), pnpm
@@ -56,6 +61,13 @@ cp frontend/.env.example frontend/.env.local
 - **`backend/.env`** / **`frontend/.env.local`** — only used if you run that app
   directly on the host, outside of Compose (see below). They use `localhost` instead
   of Compose service names, since the host can't resolve container DNS names.
+- **`SESSION_COOKIE_NAME`** / **`SESSION_LIFETIME_DAYS`** (backend, optional) —
+  configure the authentication session cookie; see
+  [Users & Authentication](#users--authentication) below. Both have sensible defaults
+  (`ts_session`, `30`) and are not present in `compose.yml` since the defaults are
+  fine for local development — set them as real environment variables (not `.env`
+  files, which aren't loaded in production-like deployments) if you need to override
+  them.
 
 ## 2. Start the stack
 
@@ -92,8 +104,11 @@ To run in the background: `podman compose up --build -d`.
 - **Frontend:** http://localhost:3000 — shows API reachability and database status,
   fetched server-side on load, with a "Check again" button for a client-side re-check.
 - **Production catalogue:** http://localhost:3000/productions
+- **Sign up / Log in:** http://localhost:3000/register / http://localhost:3000/login
+- **Account summary:** http://localhost:3000/me
 - **Backend health check:** http://localhost:8000/health
 - **Production catalogue API:** http://localhost:8000/api/v1/productions
+- **Auth API:** http://localhost:8000/api/v1/auth/{register,login,logout,me}
 - **Swagger UI:** http://localhost:8000/docs
 - **ReDoc:** http://localhost:8000/redoc
 - **OpenAPI schema:** http://localhost:8000/openapi.json
@@ -332,6 +347,153 @@ be exercised directly against the API.
 - **Backend hot-reload on macOS bind mounts** (pre-existing Phase 1 limitation, see
   above) also applies to the new Production code.
 
+## Users & Authentication
+
+Phase 4 adds minimal identity and authenticated ownership: registration, login,
+logout, and a `/me` account summary. There are still no profiles, follows, OAuth,
+password reset, email verification, or roles/permissions beyond "authenticated or
+not" — those are explicitly out of scope until a later phase needs them.
+
+### Session-cookie authentication (not JWT)
+
+Authentication is a conventional **server-side session** backed by an **HTTP-only
+cookie**, not a JWT:
+
+```
+Browser cookie (opaque, high-entropy token)
+  → SHA-256 hash of the token
+  → looked up against the `sessions` table (token_hash column)
+  → Session row (if found, not expired)
+  → associated User (eagerly loaded)
+```
+
+- The browser only ever holds an opaque random token in an `HttpOnly` cookie — it
+  cannot be read by JavaScript, and there is nothing meaningful to steal via XSS.
+- The database only ever stores a SHA-256 hash of that token (`sessions.token_hash`).
+  A stolen database dump cannot be replayed as a valid session cookie, and the raw
+  token is never logged.
+- There is no `SESSION_SECRET_KEY`: tokens are opaque and looked up by their hash,
+  never signed or decoded, so no server-side secret is needed to issue or verify one.
+
+### Data model
+
+- **`users`** — `id` (UUID), `username` (unique, indexed), `email` (unique, indexed,
+  always stored lowercased + stripped), `password_hash` (Argon2id, never returned by
+  any API response), `created_at`, `updated_at`. No profile fields.
+- **`sessions`** — `id` (UUID), `user_id` (FK → `users.id`, `ON DELETE CASCADE`),
+  `token_hash` (unique, indexed), `expires_at`, `created_at`. Sessions are immutable
+  once created (looked up or deleted, never edited), so there is no `updated_at`.
+
+Deleting a User cascades to their Sessions at the database level (`ON DELETE
+CASCADE`), so there's no risk of orphaned session rows even for direct SQL deletes.
+
+### Endpoints
+
+| Method | Path                    | Behavior                                             |
+|--------|-------------------------|-------------------------------------------------------|
+| POST   | `/api/v1/auth/register` | Create a User + Session, set the cookie, return the User |
+| POST   | `/api/v1/auth/login`    | Verify credentials, rotate the Session, set the cookie |
+| POST   | `/api/v1/auth/logout`   | Delete the current Session (if any), clear the cookie  |
+| GET    | `/api/v1/auth/me`       | Return the current User, or `401` if not authenticated |
+
+All four accept/return JSON. `register` returns `201`, `login`/`me` return `200`,
+`logout` returns `204`. `register`/`login` responses never include `password_hash`.
+
+### Password & session security
+
+- **Passwords** are hashed with **Argon2id** (via `pwdlib[argon2]`) — a memory-hard
+  KDF designed for low-entropy, human-chosen secrets. Passwords must be 8-128
+  characters; there are no arbitrary complexity rules (uppercase/symbol requirements
+  etc.) beyond that minimum length.
+- **Session tokens** are generated with `secrets.token_urlsafe(32)` (~256 bits of
+  entropy) — the opposite case from passwords: already high-entropy, so a fast
+  SHA-256 hash is appropriate (and intentionally *not* used for passwords).
+- **Login failures** (wrong password *and* nonexistent email) return the identical
+  generic `401 Invalid email or password` — the API never reveals whether an email
+  is registered.
+- **Session rotation:** logging in while an existing (valid, expired, or stale)
+  session cookie is present deletes that session before issuing a new one, so
+  repeated logins from the same browser don't accumulate redundant session rows.
+  Registration always creates a fresh session (there is no pre-existing session to
+  rotate at that point).
+- **Expiry:** sessions default to a 30-day lifetime (`SESSION_LIFETIME_DAYS`). An
+  expired session is treated as unauthenticated (`401`) and deleted opportunistically
+  the next time it's looked up — there is no scheduled cleanup job in this phase.
+- **CORS:** `allow_credentials=True` with an explicit, non-wildcard origin allowlist
+  (`CORS_ORIGINS`) — required for the browser to send/receive the session cookie
+  cross-origin (frontend on `:3000`, backend on `:8000`) in local development.
+
+### Cookie configuration
+
+| Setting     | Default      | Notes                                                        |
+|-------------|--------------|---------------------------------------------------------------|
+| Name        | `ts_session` | `SESSION_COOKIE_NAME`                                          |
+| `HttpOnly`  | `true`       | always — never readable from JavaScript                       |
+| `Secure`    | environment-dependent | `false` when `ENVIRONMENT=development` (plain HTTP locally), `true` otherwise |
+| `SameSite`  | `Lax`        | always                                                         |
+| `Path`      | `/`          | always                                                         |
+| `Max-Age`   | 30 days      | `SESSION_LIFETIME_DAYS`                                        |
+
+### Frontend routes
+
+- **`/register`** — username, email, password. On success the user is already
+  authenticated (registration creates a session), and the app navigates home.
+- **`/login`** — email, password. Renders the backend's generic
+  `Invalid email or password` error on failure; navigates home on success.
+- **`/me`** — minimal authenticated account summary (username, email, member-since
+  date). Prompts unauthenticated visitors to log in instead of exposing any data.
+- **Navigation:** shows `Log in` / `Sign up` links when signed out, or a
+  `USERNAME ▾` menu (Account, Log out) when signed in. Auth state is restored on
+  every page load via `GET /api/v1/auth/me`, using a small React context
+  (`components/auth-provider.tsx`) — no Redux/Zustand/NextAuth, and nothing is
+  persisted independently in `localStorage`; the backend session is always the
+  source of truth.
+- Auth requests are added to the existing typed API-client pattern
+  (`frontend/lib/auth.ts`, alongside `lib/api.ts` and `lib/productions.ts`) and use
+  `credentials: "include"` so the browser sends/receives the session cookie;
+  existing Production catalogue requests are unaffected.
+
+### Example requests
+
+Register:
+
+```bash
+curl -i -c cookies.txt -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username": "alice", "email": "alice@example.com", "password": "correct-horse-battery"}'
+```
+
+Log in (reusing the cookie jar from above, or a fresh one):
+
+```bash
+curl -i -c cookies.txt -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice@example.com", "password": "correct-horse-battery"}'
+```
+
+Get the current user (sends the cookie saved above):
+
+```bash
+curl -i -b cookies.txt http://localhost:8000/api/v1/auth/me
+```
+
+Log out:
+
+```bash
+curl -i -b cookies.txt -X POST http://localhost:8000/api/v1/auth/logout
+```
+
+### Known limitations
+
+- No password reset or email verification — a registered email is never confirmed.
+- No multi-device session management UI: a User can hold multiple valid Sessions at
+  once (one per browser/device that has logged in), and there is no way to list or
+  revoke them individually. "Rotate on login" only replaces the session matching the
+  cookie already present on that specific login request — it does not affect
+  sessions on other devices.
+- No scheduled cleanup of expired sessions; rows are removed opportunistically when
+  encountered, which is acceptable at this scale but would need a periodic job later.
+
 ## Stopping, rebuilding, logs
 
 ```bash
@@ -388,9 +550,11 @@ podman compose exec backend uv run alembic current
 ```
 
 An initial, empty migration (`backend/alembic/versions/0001_initial.py`) establishes
-the Alembic baseline. `backend/alembic/versions/0002_create_productions_table.py`
-creates the `productions` table (see [Production Catalogue (v0.1)](#production-catalogue-v01)).
-Both are reversible (`alembic downgrade -1` cleanly undoes either one).
+the Alembic baseline. `0002_create_productions_table.py` creates the `productions`
+table (see [Production Catalogue (v0.1)](#production-catalogue-v01)).
+`0003_create_users_and_sessions_tables.py` creates the `users` and `sessions` tables
+(see [Users & Authentication](#users--authentication)). All three are reversible
+(`alembic downgrade -1` cleanly undoes the most recent one).
 
 ### Seed data
 
@@ -456,17 +620,18 @@ running containers).
 ```bash
 uv run ruff check .           # lint
 uv run ruff format --check .  # format check (use `ruff format .` to fix)
-uv run pytest                 # tests (health, app startup, Production catalogue)
+uv run pytest                 # tests (health, app startup, Production catalogue, auth)
 ```
 
-The Production catalogue tests exercise real SQL (case-insensitive search, unique
-slugs, ordering) against an actual PostgreSQL database rather than a mocked session —
-consistent with the project's "async SQLAlchemy, no mocking layer" approach. This
-means `pytest` requires a reachable database at `DATABASE_URL` (e.g.
-`podman compose up -d postgres`, with `backend/.env` pointing at `localhost:5432` as
-usual for host-side runs). The test suite creates the schema automatically if missing
-and truncates the `productions` table between tests for isolation, so it's safe to run
-repeatedly and does not require running migrations first.
+The Production catalogue and authentication tests exercise real SQL (case-insensitive
+search, unique slugs/usernames/emails, ordering) against an actual PostgreSQL database
+rather than a mocked session — consistent with the project's "async SQLAlchemy, no
+mocking layer" approach. This means `pytest` requires a reachable database at
+`DATABASE_URL` (e.g. `podman compose up -d postgres`, with `backend/.env` pointing at
+`localhost:5432` as usual for host-side runs). The test suite creates the schema
+automatically if missing and truncates the `productions`, `sessions`, and `users`
+tables between tests for isolation, so it's safe to run repeatedly and does not
+require running migrations first.
 
 ### Frontend (from `frontend/`)
 

@@ -10,7 +10,7 @@ from sqlalchemy import text
 from app.db.base import Base
 from app.db.session import engine, get_db
 from app.main import app
-from app.models import Production  # noqa: F401 - ensures Base.metadata includes it
+from app.models import Production, Session, User  # noqa: F401 - ensures Base.metadata includes them
 
 
 @pytest.fixture
@@ -51,9 +51,13 @@ async def _prepare_schema() -> AsyncGenerator[None, None]:
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _clean_productions_table() -> AsyncGenerator[None, None]:
-    """Truncate the productions table before every test for isolation."""
+async def _clean_tables() -> AsyncGenerator[None, None]:
+    """Truncate every domain table before each test, for isolation.
+
+    Listed together in one statement so Postgres handles the `sessions` ->
+    `users` foreign key correctly regardless of order.
+    """
 
     async with engine.begin() as connection:
-        await connection.execute(text("TRUNCATE TABLE productions"))
+        await connection.execute(text("TRUNCATE TABLE productions, sessions, users"))
     yield
