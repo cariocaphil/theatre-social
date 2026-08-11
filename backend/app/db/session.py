@@ -14,7 +14,17 @@ from app.core.config import get_settings
 
 def create_engine() -> AsyncEngine:
     settings = get_settings()
-    return create_async_engine(settings.database_url, pool_pre_ping=True, future=True)
+    # `ssl` (not `sslmode`) is the only TLS knob asyncpg's `connect()` accepts;
+    # SQLAlchemy's asyncpg dialect forwards query-string params from
+    # `database_url` straight through as connect() kwargs, so a `?sslmode=...`
+    # query parameter would raise a TypeError instead of configuring TLS. See
+    # `Settings.database_ssl_mode` for the environment-driven value.
+    return create_async_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        future=True,
+        connect_args={"ssl": settings.database_ssl_mode},
+    )
 
 
 engine: AsyncEngine = create_engine()

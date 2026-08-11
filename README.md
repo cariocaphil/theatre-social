@@ -28,12 +28,24 @@ half-star rating and text review, viewable/editable at `/diary` (see [Production
 Logging & Diary](#production-logging--diary) below). There is still no likes,
 follows, comments, feeds, aggregate ratings, or public profiles.
 
+Phase 6 adds **Azure Production Deployment & Continuous Delivery**: the frontend
+and backend each run as their own Azure Container App, backed by Azure Database
+for PostgreSQL Flexible Server, with GitHub Actions deploying to production
+automatically on every merge to `main` once CI passes (see [Production
+Deployment](#production-deployment) below). This phase is infrastructure and
+deployment only — no new application functionality.
+
 ```
 theatre-social/
-├── frontend/     Next.js (TypeScript, App Router), pnpm
-├── backend/      FastAPI, SQLAlchemy 2 (async), Alembic, uv
-├── compose.yml   Postgres + backend + frontend orchestration
-├── .env.example  Compose-level environment variables
+├── frontend/           Next.js (TypeScript, App Router), pnpm
+│   ├── Dockerfile        Dev image (bind-mounted source, `pnpm dev`)
+│   └── Dockerfile.prod   Production image (standalone build, Azure Container Apps)
+├── backend/            FastAPI, SQLAlchemy 2 (async), Alembic, uv
+│   ├── Dockerfile        Dev image (bind-mounted source, `--reload`)
+│   └── Dockerfile.prod   Production image (Azure Container Apps)
+├── .github/workflows/  CI (every push/PR) + CD (main only, after CI passes)
+├── compose.yml         Postgres + backend + frontend orchestration (local dev only)
+├── .env.example        Compose-level environment variables
 └── README.md
 ```
 
@@ -871,3 +883,575 @@ database) before running the `uv run` commands.
 - **Stale dependencies after changing `package.json` / `pyproject.toml`:** rebuild with
   `podman compose up --build` so the `frontend_node_modules` / `backend_venv` named
   volumes get repopulated from the new lockfile.
+
+## Production Deployment
+
+Phase 6 deploys the app to Azure: a frontend Azure Container App, a backend Azure
+Container App, and Azure Database for PostgreSQL Flexible Server, wired together by a
+GitHub Actions Continuous Delivery pipeline that runs after CI passes on `main`.
+**Nothing here changes local development** — `podman compose up` (or `docker compose
+up`) still works exactly as described above, and no Azure setting is required to run
+the app locally.
+
+```text
+                    GitHub
+                       │
+                 GitHub Actions
+              CI (every push/PR) ──► CD (main only, after CI)
+                       │                        │
+          ┌────────────┴──────────┐   migrate → deploy-backend → deploy-frontend
+          │                       │             │                │
+          ▼                       ▼             ▼                ▼
+    Next.js frontend        FastAPI backend   Alembic          images pushed to
+   Azure Container App     Azure Container App  upgrade         ghcr.io, then
+                       │                │        head        `az containerapp update`
+                       │   HTTPS API    │
+                       └───────────────►│
+                                        ▼
+                          Azure Database for PostgreSQL
+                                Flexible Server
+```
+
+### Architecture and why
+
+| Component | Choice | Why |
+| --- | --- | --- |
+| Frontend hosting | Azure Container Apps | Next.js already builds a self-contained `output: "standalone"` server; a container gives full control over the Node process (start command, port, env vars) with no framework-specific adapter. Rejected **Static Web Apps**: its Next.js hybrid/SSR support has real adaptation and runtime constraints for App Router + a custom standalone server — not worth the risk. Rejected **App Service (Node.js runtime)**: viable, but its Oryx build/deploy pipeline would re-introduce framework-detection behavior the project doesn't need, for no benefit over a container we already know builds correctly. |
+| Backend hosting | Azure Container Apps | FastAPI/Uvicorn is already containerized; Container Apps' consumption plan can **scale to zero**, unlike App Service's Basic/Standard plans (billed 24/7 regardless of traffic) — important for an MVP with ~no traffic. Using the same hosting model as the frontend also halves the number of deployment mechanisms to operate and document. |
+| Container registry | GitHub Container Registry (`ghcr.io`) | Avoids an extra ~$5/mo Azure Container Registry resource; images stay registry-agnostic (portable to any other host later). |
+| Database | Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, single zone | Cheapest general-purpose PostgreSQL tier suitable for an MVP; no HA/multi-zone, consistent with "cost visibility over premature scalability". |
+| CI/CD | Existing `ci.yml`, extended with `migrate` / `deploy-backend` / `deploy-frontend` jobs | Reuses the existing quality gate instead of a second parallel workflow; `needs:` makes a failed lint/test/build block deployment without repeating that work. |
+| Azure auth | OIDC via `azure/login`, no stored client secret | No long-lived credential to leak or rotate; federated credential is scoped to this repo's `production` GitHub Environment. |
+| Migrations | `alembic upgrade head` as a CD step, before either app is deployed | Simplest reliable option — no Container Apps Jobs, no custom orchestration. |
+
+### Azure resources required
+
+| Resource | Purpose | SKU / tier |
+| --- | --- | --- |
+| Resource group `theatre-social-prod` | Groups every Phase 6 resource for easy cost tracking / cleanup | n/a |
+| Container Apps Environment `theatre-social-env` | Shared hosting environment for both Container Apps (Log Analytics workspace included) | Consumption |
+| Container App `theatre-social-backend` | Runs the FastAPI backend | Consumption, 0.25 vCPU / 0.5 GiB, 0–2 replicas |
+| Container App `theatre-social-frontend` | Runs the Next.js frontend | Consumption, 0.25 vCPU / 0.5 GiB, 0–2 replicas |
+| Azure Database for PostgreSQL Flexible Server (name of your choosing, globally unique) | Production database | Burstable `Standard_B1ms`, 32 GiB storage, PostgreSQL 16, single zone |
+| GitHub Container Registry (`ghcr.io`, not an Azure resource) | Stores built backend/frontend images | Free (public packages) |
+| Microsoft Entra App Registration `theatre-social-gha-deploy` | Federated identity GitHub Actions uses to authenticate to Azure | n/a (no cost) |
+
+### Environment variables
+
+| Name | Used by | Purpose | Secret? | Configured where |
+| --- | --- | --- | --- | --- |
+| `ENVIRONMENT` | backend | Switches cookie `Secure`/`SameSite` flags to production-strict | No | Backend Container App setting (`production`) |
+| `DATABASE_URL` | backend, Alembic | asyncpg connection string to Azure Postgres | **Yes** | Backend Container App secret; `PROD_DATABASE_URL` GitHub Actions secret (used only by the `migrate` CD job) |
+| `DATABASE_SSL_MODE` | backend, Alembic | TLS negotiation mode for the DB connection (`require` in prod) | No | Backend Container App setting; CD workflow env (`migrate` job) |
+| `CORS_ORIGINS` | backend | Allowed browser origin(s) for the deployed frontend | No | Backend Container App setting |
+| `SESSION_COOKIE_NAME` / `SESSION_LIFETIME_DAYS` | backend | Session cookie name/lifetime (optional, has defaults) | No | Backend Container App setting, only if overriding the default |
+| `INTERNAL_API_URL` | frontend (server-side) | Backend URL used by Next.js server-side rendering/fetches | No | Frontend Container App setting |
+| `NEXT_PUBLIC_API_URL` | frontend (browser-side) | Backend URL used by client-side `fetch` calls | No | **Docker build arg** (inlined at build time — see `frontend/Dockerfile.prod`), sourced from the `BACKEND_PUBLIC_URL` GitHub Actions repository variable |
+| `PORT` | both (optional) | Overrides the port each app listens on (defaults: backend `8000`, frontend `3000`) | No | Container App setting, only if the target port ever needs to change |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | CD workflow (`azure/login`) | OIDC federated identity for GitHub Actions → Azure | **Yes** (repo secrets, not disclosed as secret *values*) | GitHub repository secrets |
+| `AZURE_RESOURCE_GROUP` / `AZURE_BACKEND_APP_NAME` / `AZURE_FRONTEND_APP_NAME` / `BACKEND_PUBLIC_URL` | CD workflow | Names Azure resources to deploy to; backend's public URL for the frontend build | No | GitHub repository **variables** |
+
+Never commit real values for any of the above — `.env.example` files only ever contain
+placeholders (see `backend/.env.example` and `frontend/.env.example` for the exact
+production block, commented out).
+
+### Database SSL
+
+Azure Database for PostgreSQL Flexible Server requires TLS. The obvious-looking fix —
+adding `?sslmode=require` to `DATABASE_URL` — **does not work** with this stack:
+SQLAlchemy's asyncpg dialect forwards every `DATABASE_URL` query parameter straight
+through as a keyword argument to `asyncpg.connect()`, which has no `sslmode` parameter
+(only `ssl`). Passing `sslmode=require` this way raises a `TypeError` at connection
+time, not a working SSL connection.
+
+Instead, `Settings.database_ssl_mode` (`app/core/config.py`) is a dedicated setting
+passed as `connect_args={"ssl": ...}` to `create_async_engine` (`app/db/session.py`)
+**and** to Alembic's own separately-constructed engine (`alembic/env.py`, which does
+not reuse `app/db/session.py`). The value is forwarded to `asyncpg`, which understands
+the libpq-style mode names directly (`disable` / `allow` / `prefer` / `require` /
+`verify-ca` / `verify-full`).
+
+- **Local/CI**: `DATABASE_SSL_MODE` is unset, defaulting to `"prefer"` — identical to
+  the historical, unconfigured behavior against a non-SSL local/CI Postgres (verified:
+  connects in plaintext, no behavior change).
+- **Production**: `DATABASE_SSL_MODE=require` — verified against a local Postgres with
+  no SSL listener that `require`/`True` correctly *fails* (proving it actually enforces
+  TLS, not just requesting it opportunistically) while `prefer`/`disable`/`allow`
+  succeed. `require` encrypts the connection but does not verify the server's
+  certificate; `verify-full` is a stronger optional upgrade (see
+  [Problems / compromises](#problems--compromises) in the deployment report for this
+  phase, if you have it, or just set `DATABASE_SSL_MODE=verify-full` — the base Python
+  image ships a CA bundle that should chain to Azure's public root CA).
+
+Covered by `backend/tests/test_config.py` (the setting itself) and
+`backend/tests/test_db_session.py` (that `create_engine()` actually wires it into
+`connect_args`).
+
+### Cross-site session cookie
+
+Locally, the frontend (`localhost:3000`) and backend (`localhost:8000`) share the same
+registrable domain ("localhost"), so `SameSite=Lax` works for the browser's
+cross-origin `fetch(..., {credentials: "include"})` calls. In production the frontend
+and backend are on **different** Azure hostnames — a genuinely cross-*site* setup —
+and `Lax` cookies are withheld from cross-site `fetch`/XHR entirely (only sent on
+top-level navigation), which would silently break `/me`, diary, etc. after a
+seemingly-successful login. `Settings.session_cookie_samesite` (paired with the
+existing `session_cookie_secure`, since browsers require `Secure` alongside
+`SameSite=None`) fixes this: `Lax`/non-`Secure` in development, `None`/`Secure`
+everywhere else — both derived from `ENVIRONMENT`, no separate flag needed.
+
+### Continuous Delivery flow
+
+`.github/workflows/ci.yml` now has five jobs. The original two are unchanged:
+
+```text
+Pull Request / any push
+  ├── frontend   (lint, typecheck, test, build)
+  └── backend    (lint, format check, migrate-from-empty, test)
+```
+
+Pushing to `main` runs those two jobs exactly as before, **plus** three more that only
+run for `main` pushes (`if: github.ref == 'refs/heads/main' && github.event_name ==
+'push'`) and only after both succeed (`needs: [frontend, backend]`):
+
+```text
+push to main
+  ├── frontend ──┐
+  └── backend  ──┤
+                 ▼
+              migrate            (alembic upgrade head, against Azure Postgres)
+                 ▼
+           deploy-backend        (build+push image, az containerapp update)
+                 ▼
+           deploy-frontend       (build+push image, az containerapp update)
+```
+
+- A failed `frontend`/`backend` job — or a failed `migrate`/`deploy-*` step — stops the
+  chain there; nothing downstream runs, and the failure is visible directly in the
+  GitHub Actions run.
+- All three CD jobs share `concurrency: { group: cd-production, cancel-in-progress:
+  false }`, so a second push to `main` while a deploy is in flight queues behind it
+  instead of racing it.
+- Nothing in the CD jobs repeats the frontend/backend lint/type-check/test/build work —
+  they only build the already-tested code into a container image.
+- Feature branches and pull requests never reach the CD jobs at all (the `if` guard on
+  `migrate`).
+
+### Azure OIDC authentication
+
+GitHub Actions authenticates to Azure via `azure/login` using OpenID Connect — no
+client secret is stored anywhere. The federated credential is scoped to this
+repository's `production` GitHub Environment (`repo:<org>/<repo>:environment:production`),
+and the identity's Azure role assignment is scoped to the `theatre-social-prod`
+resource group only (`Contributor`) — not the subscription.
+
+**Repository changes (already done by this phase):** the CD jobs in `ci.yml`
+reference `${{ secrets.AZURE_CLIENT_ID }}`, `${{ secrets.AZURE_TENANT_ID }}`, `${{
+secrets.AZURE_SUBSCRIPTION_ID }}`, `${{ secrets.PROD_DATABASE_URL }}`, and the
+`${{ vars.* }}` repository variables listed in [Environment
+variables](#environment-variables) above.
+
+**GitHub manual configuration (you must do this):**
+1. Create a GitHub Environment named `production` (**Settings → Environments → New
+   environment**). Optionally add required reviewers/protection rules here later.
+2. Add repository secrets (**Settings → Secrets and variables → Actions → Secrets**):
+   `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `PROD_DATABASE_URL`.
+3. Add repository variables (same page, **Variables** tab): `AZURE_RESOURCE_GROUP`,
+   `AZURE_BACKEND_APP_NAME`, `AZURE_FRONTEND_APP_NAME`, `BACKEND_PUBLIC_URL`.
+
+**Azure/Microsoft Entra manual configuration (you must do this):** see [Manual setup
+guide](#manual-setup-guide) below for the exact commands — creating the App
+Registration, its federated credential, and the RBAC role assignment.
+
+### Manual setup guide
+
+Everything below requires the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+logged in (`az login`) with an account that can create resources and role assignments,
+plus Docker or Podman for the one-time bootstrap image builds. Replace
+`<placeholders>` with real values; `<owner>/<repo>` is this GitHub repository's
+`OWNER/REPO`. Pick any Azure region close to you — examples below use `westeurope`.
+
+**1. Sign in and select the subscription**
+
+```bash
+az login
+az account set --subscription "<SUBSCRIPTION_ID>"
+```
+
+**2. Create the resource group**
+
+```bash
+az group create --name theatre-social-prod --location westeurope
+```
+
+**3. Create the PostgreSQL Flexible Server**
+
+Server names must be globally unique (they become
+`<name>.postgres.database.azure.com`). Generate a strong admin password and store it
+somewhere safe — you'll need it for `PROD_DATABASE_URL`.
+
+```bash
+az postgres flexible-server create \
+  --name <UNIQUE-SERVER-NAME> \
+  --resource-group theatre-social-prod \
+  --location westeurope \
+  --admin-user theatre_social_admin \
+  --admin-password "<STRONG_PASSWORD>" \
+  --sku-name Standard_B1ms \
+  --tier Burstable \
+  --storage-size 32 \
+  --version 16 \
+  --high-availability Disabled \
+  --public-access None
+
+az postgres flexible-server db create \
+  --resource-group theatre-social-prod \
+  --server-name <UNIQUE-SERVER-NAME> \
+  --database-name theatre_social
+```
+
+**4. Configure database networking (public access, MVP tradeoff)**
+
+The CD pipeline's `migrate` job runs `alembic upgrade head` directly from a
+GitHub-hosted runner, which has no fixed IP range Azure can allow-list precisely. For
+this MVP, the firewall allows all public IPs — TLS (`require`) and Postgres
+authentication are still fully enforced, but this is broader network exposure than
+ideal; see [Problems / compromises](#problems--compromises) for the recommended
+follow-up (self-hosted runner, VNet integration, or a Container Apps Job instead).
+
+```bash
+az postgres flexible-server firewall-rule create \
+  --resource-group theatre-social-prod \
+  --name <UNIQUE-SERVER-NAME> \
+  --rule-name AllowAllForGitHubActions \
+  --start-ip-address 0.0.0.0 \
+  --end-ip-address 255.255.255.255
+```
+
+Your `PROD_DATABASE_URL` (for the GitHub secret in step 9) is now:
+
+```text
+postgresql+asyncpg://theatre_social_admin:<STRONG_PASSWORD>@<UNIQUE-SERVER-NAME>.postgres.database.azure.com:5432/theatre_social
+```
+
+**5. Create the Container Apps Environment**
+
+```bash
+az extension add --name containerapp --upgrade
+az containerapp env create \
+  --name theatre-social-env \
+  --resource-group theatre-social-prod \
+  --location westeurope
+```
+
+**6. Bootstrap the backend Container App (one-time; CD takes over afterwards)**
+
+```bash
+cd backend
+docker build -f Dockerfile.prod -t ghcr.io/<owner>/<repo>/backend:bootstrap .
+docker login ghcr.io -u <your-github-username>   # use a PAT with write:packages
+docker push ghcr.io/<owner>/<repo>/backend:bootstrap
+cd ..
+```
+
+Make the `ghcr.io/<owner>/<repo>/backend` package **public** afterwards (GitHub →
+your profile/org → Packages → the package → Package settings → Change visibility),
+so Container Apps can pull it without extra registry credentials. If you'd rather keep
+it private, add `--registry-server ghcr.io --registry-username <user>
+--registry-password <PAT>` to the `az containerapp create` command below instead.
+
+```bash
+az containerapp create \
+  --name theatre-social-backend \
+  --resource-group theatre-social-prod \
+  --environment theatre-social-env \
+  --image ghcr.io/<owner>/<repo>/backend:bootstrap \
+  --target-port 8000 \
+  --ingress external \
+  --min-replicas 0 --max-replicas 2 \
+  --cpu 0.25 --memory 0.5Gi \
+  --secrets database-url="<PROD_DATABASE_URL from step 4>" \
+  --env-vars \
+    ENVIRONMENT=production \
+    DATABASE_SSL_MODE=require \
+    DATABASE_URL=secretref:database-url \
+    CORS_ORIGINS=https://placeholder.example
+
+az containerapp show --name theatre-social-backend --resource-group theatre-social-prod \
+  --query properties.configuration.ingress.fqdn -o tsv
+# -> note this as BACKEND_PUBLIC_URL, prefixed with "https://"
+```
+
+**7. Bootstrap the frontend Container App**
+
+```bash
+cd frontend
+docker build -f Dockerfile.prod -t ghcr.io/<owner>/<repo>/frontend:bootstrap \
+  --build-arg NEXT_PUBLIC_API_URL="https://<backend-fqdn-from-step-6>" .
+docker push ghcr.io/<owner>/<repo>/frontend:bootstrap
+cd ..
+```
+
+Make this package public too (same steps as above), then:
+
+```bash
+az containerapp create \
+  --name theatre-social-frontend \
+  --resource-group theatre-social-prod \
+  --environment theatre-social-env \
+  --image ghcr.io/<owner>/<repo>/frontend:bootstrap \
+  --target-port 3000 \
+  --ingress external \
+  --min-replicas 0 --max-replicas 2 \
+  --cpu 0.25 --memory 0.5Gi \
+  --env-vars \
+    INTERNAL_API_URL="https://<backend-fqdn-from-step-6>" \
+    NEXT_PUBLIC_API_URL="https://<backend-fqdn-from-step-6>"
+
+az containerapp show --name theatre-social-frontend --resource-group theatre-social-prod \
+  --query properties.configuration.ingress.fqdn -o tsv
+```
+
+**8. Point the backend's CORS at the real frontend URL**
+
+```bash
+az containerapp update --name theatre-social-backend --resource-group theatre-social-prod \
+  --set-env-vars CORS_ORIGINS="https://<frontend-fqdn-from-step-7>"
+```
+
+**9. Configure the deployment identity (OIDC)**
+
+```bash
+APP_ID=$(az ad app create --display-name "theatre-social-gha-deploy" --query appId -o tsv)
+az ad sp create --id "$APP_ID"
+
+az ad app federated-credential create --id "$APP_ID" --parameters '{
+  "name": "theatre-social-github-production",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:<owner>/<repo>:environment:production",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+
+RG_ID=$(az group show --name theatre-social-prod --query id -o tsv)
+az role assignment create --assignee "$APP_ID" --role "Contributor" --scope "$RG_ID"
+
+echo "AZURE_CLIENT_ID:       $APP_ID"
+echo "AZURE_TENANT_ID:       $(az account show --query tenantId -o tsv)"
+echo "AZURE_SUBSCRIPTION_ID: $(az account show --query id -o tsv)"
+```
+
+**10. GitHub repository configuration** — see [Azure OIDC
+authentication](#azure-oidc-authentication) above for the exact secrets/variables to
+add, using the values from steps 4, 6, 7, and 9.
+
+**11. Run the initial migration and seed manually, once**
+
+The very first deploy needs the schema and (optionally) seed data to exist before
+anyone visits the site — do this once, by hand, before merging anything to `main`
+(after that, `migrate` in CD keeps the schema current automatically):
+
+```bash
+cd backend
+DATABASE_URL="<PROD_DATABASE_URL>" DATABASE_SSL_MODE=require uv run alembic upgrade head
+DATABASE_URL="<PROD_DATABASE_URL>" DATABASE_SSL_MODE=require uv run python -m app.db.seed
+```
+
+**12. Trigger production deployment**
+
+Merge a pull request into `main` (or push directly). Watch the `migrate` /
+`deploy-backend` / `deploy-frontend` jobs in the **Actions** tab.
+
+**13. Run the smoke tests**
+
+See [Production smoke testing](#production-smoke-testing) below.
+
+### Database migrations
+
+- **When**: automatically, in the `migrate` CD job, before either app is redeployed —
+  on every push to `main` that passes CI.
+- **Where**: on the GitHub-hosted runner, connecting directly to the Azure Postgres
+  public endpoint (no Azure API access needed for this step, so it doesn't use
+  `azure/login`).
+- **Which credentials**: the `PROD_DATABASE_URL` GitHub secret (the same admin login
+  created in Manual setup guide step 3).
+- **On failure**: the job fails, `deploy-backend`/`deploy-frontend` never run (via
+  `needs:`), and neither Container App is touched — production keeps running its
+  previous (already-migrated) version.
+- **Manual run**: `cd backend && DATABASE_URL="<PROD_DATABASE_URL>" DATABASE_SSL_MODE=require uv run alembic upgrade head`
+  from any machine with network access to the database (e.g. your own machine, once
+  the firewall rule from step 4 is in place).
+- Only ever runs `alembic upgrade head` — forward migrations only. No automatic
+  downgrades, ever (see [Rollback](#rollback-and-failure-handling)).
+
+### Production seed data
+
+The seed script (`backend/app/db/seed.py`) is unchanged from local development and
+already idempotent — it looks up each Production by its stable `slug` before
+inserting, so re-running it is always safe and never deletes or overwrites existing
+data (including any real user-created data, since it only ever touches the
+`productions` table by `slug`).
+
+**Alembic migrations** (schema) and **seed data** (a fixed set of example
+Productions) are separate concerns: migrations run automatically in CD; seeding is a
+deliberate, manual, one-time action for a fresh environment — the CD pipeline never
+runs the seed script.
+
+```bash
+cd backend
+DATABASE_URL="<PROD_DATABASE_URL>" DATABASE_SSL_MODE=require uv run python -m app.db.seed
+```
+
+### Health checks
+
+`GET /health` (`backend/app/api/routes/health.py`) runs a real `SELECT 1` against the
+database and returns `200 {"status": "ok", "database": "connected"}` or `503
+{"status": "error", "database": "disconnected", "detail": "Database connection
+failed"}` — it verifies both "the process is running" and "the database is reachable",
+without ever exposing credentials, stack traces, or infrastructure details. This was
+already true before Phase 6; no changes were needed.
+
+Azure Container Apps' liveness/readiness probes are not configured with a custom path
+by default; if you want them pointed at `/health` explicitly:
+
+```bash
+az containerapp update --name theatre-social-backend --resource-group theatre-social-prod \
+  --set-probe-path liveness=/health
+```
+
+Frontend has no equivalent endpoint — the root page itself (a normal HTTP `200`) is
+sufficient as a liveness signal for the Container App.
+
+### Logs and observability
+
+- **Backend/frontend logs**: `az containerapp logs show --name <app-name>
+  --resource-group theatre-social-prod --follow` (Container Apps ships stdout/stderr
+  to the environment's Log Analytics workspace automatically — no extra setup).
+- **Deployment failures**: visible directly in the GitHub Actions run (Actions tab →
+  the failed job/step).
+- **Startup failures**: `az containerapp revision list` / `az containerapp logs show`
+  surface container crashes and their exit reasons.
+- **Optional improvement**: Azure Application Insights can be added later with very
+  little code (`--enable-dapr`-style app setting + the Python/Node SDK) — deliberately
+  not added in this phase to keep observability minimal, per scope.
+- Explicitly not introduced: Prometheus, Grafana, OpenTelemetry infrastructure, ELK,
+  distributed tracing.
+
+### Deployment procedure
+
+Normal flow: open a PR → CI runs → merge to `main` → CD runs automatically (`migrate`
+→ `deploy-backend` → `deploy-frontend`). Nothing to trigger by hand.
+
+### Rollback and failure handling
+
+- **Redeploy a previous backend/frontend version**: every image is tagged with its
+  commit SHA (`ghcr.io/<owner>/<repo>/backend:<sha>`, similarly for `frontend`), so
+  rolling back is:
+  ```bash
+  az containerapp update --name theatre-social-backend --resource-group theatre-social-prod \
+    --image ghcr.io/<owner>/<repo>/backend:<previous-good-sha>
+  ```
+  (substitute `theatre-social-frontend`/`frontend` for the frontend). Container Apps
+  also keeps prior revisions; `az containerapp revision list` / `az containerapp
+  ingress traffic set` can shift traffic back to an older revision without a rebuild.
+- **GitHub Actions failures**: a failed job stops the pipeline at that point (see
+  [Continuous Delivery flow](#continuous-delivery-flow)); re-running after a fix
+  re-triggers from a fresh push (or **Actions → Re-run jobs**).
+- **Alembic migration failure**: the `migrate` job fails, deployment never proceeds,
+  and the database is left at whatever the failed migration did/didn't complete —
+  **there is no automatic downgrade**. Fix forward (a new migration) or manually
+  investigate/repair the schema; `alembic downgrade` is a manual, deliberate action
+  only, never automatic.
+- Application rollback (redeploy an old image) and database rollback (schema/data) are
+  **different operations** — rolling back the app never implies rolling back the
+  database, and vice versa.
+
+### Production smoke testing
+
+After any deployment, verify manually (or via `curl`/browser):
+
+1. Frontend loads publicly at its Container App URL.
+2. `GET /health` on the backend URL returns `200`.
+3. (implied by #2) backend successfully reached Azure PostgreSQL.
+4. `alembic current` (run locally against `PROD_DATABASE_URL`) matches the latest
+   revision in `backend/alembic/versions/`.
+5. `/productions` loads the catalogue.
+6. Register a new account.
+7. Log in with it.
+8. Refresh the page — still logged in (`/me` persists).
+9. Open a production detail page.
+10. "Log this production" creates a diary entry.
+11. Set a rating — persists.
+12. Set/change the watched date — persists.
+13. Add review text — persists.
+14. `/diary` shows the new entry.
+15. Log out, log back in — the diary entry is still there.
+16. From a second browser/incognito session (no cookie), attempting to modify the
+    first user's diary entry via the API is rejected (401/404, matching existing
+    ownership rules).
+17. Redeploy (push a trivial change to `main`) — the app is still fully functional
+    afterwards.
+
+*(This list intentionally excludes "rewatch flag", "tags", and "private flag" from the
+original Phase 6 prompt's checklist template — those fields don't exist on
+`DiaryEntry`; see [Production Logging & Diary](#production-logging--diary) above for
+the actual fields Phase 5 implemented: `watched_at`, `rating`, `review`.)*
+
+**I have not deployed this to a real Azure subscription** (no Azure account/credentials
+are available in this environment), so every item above is reported as **NOT TESTED**
+in this phase's final report rather than claimed as passing — see that report for the
+full, honest breakdown, and re-run this checklist yourself after following the [Manual
+setup guide](#manual-setup-guide).
+
+### Costs
+
+Approximate West Europe, pay-as-you-go pricing (check the
+[Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/) for
+current numbers — these change over time and by region):
+
+| Resource | Idle cost | Notes |
+| --- | --- | --- |
+| Container Apps Environment + 2 apps (Consumption, 0.25 vCPU/0.5 GiB each, `min-replicas 0`) | ~$0/month idle | Scales to zero with no traffic; charged per vCPU-second/GiB-second only while running. Light MVP traffic: a few dollars/month. |
+| PostgreSQL Flexible Server, Burstable `Standard_B1ms`, 32 GiB | ~$12–15/month | **Does not scale to zero** — Flexible Server is always-on while it exists; this is the dominant fixed cost. Stop it (`az postgres flexible-server stop`, auto-restarts after 7 days) to pause billing for compute (storage is still billed while stopped). |
+| Log Analytics workspace (created with the Container Apps Environment) | ~$0–2/month | Pay-per-GB ingested; MVP log volume is tiny. |
+| GitHub Container Registry | $0 | Free for public packages. |
+| Microsoft Entra App Registration | $0 | No cost. |
+
+**Total**: roughly **$12–20/month** for an idle-to-light-traffic MVP, dominated by the
+always-on database.
+
+**Stopping/deleting:**
+```bash
+# Pause the database (compute only; storage still billed) without deleting data:
+az postgres flexible-server stop --name <server-name> --resource-group theatre-social-prod
+
+# Delete everything for this phase in one shot:
+az group delete --name theatre-social-prod --yes --no-wait
+```
+
+### Local development after Phase 6
+
+Unchanged. `podman compose up --build` (or `docker compose up --build`) still starts
+Postgres + backend + frontend exactly as described in [Start the
+stack](#2-start-the-stack) above. No Azure account, credentials, or setting is
+required for local startup — `DATABASE_SSL_MODE` and the cross-site cookie setting
+both default to their local-friendly values when `ENVIRONMENT`/`DATABASE_SSL_MODE`
+are simply left unset.
+
+### Portability
+
+Nothing added in this phase creates meaningful Azure lock-in:
+
+- The app still depends only on standard technologies: Next.js, Node.js, FastAPI,
+  PostgreSQL, `asyncpg`, SQLAlchemy, Alembic, plain environment variables, OCI
+  containers, and GitHub Actions.
+- No Azure SDK is used in application code — the backend/frontend don't know they're
+  running on Azure at all; every Azure-specific detail lives in the Dockerfiles' `CMD`
+  (reads `$PORT` like any other container platform would expect) and the CD workflow.
+- Images are stored in GitHub Container Registry, not an Azure-specific registry.
+- Migrating the database to, say, Amazon RDS for PostgreSQL is a `DATABASE_URL`
+  change plus (if not using RDS's own TLS setup) an equivalent `DATABASE_SSL_MODE`
+  value — no code change.
+- Migrating hosting to another container platform (Fly.io, Render, AWS, etc.) is a
+  matter of pointing that platform at the same `Dockerfile.prod` images and setting
+  the same environment variables — the CD workflow's `az containerapp update` calls
+  are the only Azure-specific lines in the entire pipeline.

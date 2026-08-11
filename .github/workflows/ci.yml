@@ -7,6 +7,9 @@ on:
     branches: [main]
 
 # Cancel superseded runs for the same branch/PR so pushes don't queue up stale CI runs.
+# Deliberately NOT applied to the deploy jobs below (see their own concurrency
+# group): a deploy that's already touching production must run to completion
+# rather than being cancelled mid-way by the next push to main.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -119,3 +122,173 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  # --- Continuous Delivery -----------------------------------------------
+  #
+  # Runs only for pushes to `main` (never for pull requests or other
+  # branches), and only once both CI jobs above have already succeeded --
+  # `needs: [frontend, backend]` makes a failed lint/test/build block
+  # deployment instead of racing ahead of it. Nothing here repeats the
+  # lint/type-check/test/build work those jobs already did.
+  #
+  # Flow: migrate (Alembic against the production DB) -> deploy-backend
+  # (build/push image, update the Container App) -> deploy-frontend (same,
+  # but also needs the backend's public URL as a build arg). See the
+  # README's "Production Deployment" section for the full picture, including
+  # the one-time Azure/GitHub setup this depends on (OIDC federation, the
+  # `AZURE_*` secrets, and the `AZURE_*` / `BACKEND_PUBLIC_URL` variables
+  # referenced below).
+  migrate:
+    name: "CD: Database migration"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    environment: production
+    # Shared across all three CD jobs: a second push to main while a deploy
+    # is in flight queues behind it rather than racing it or being dropped.
+    concurrency:
+      group: cd-production
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "backend/uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+
+      # If this fails, the job (and therefore both deploy jobs, via `needs`)
+      # fails too: the app is never deployed against a schema it doesn't
+      # match. Never runs anything destructive automatically -- only
+      # `upgrade head`, which only ever applies forward migrations.
+      - name: Apply pending Alembic migrations to production
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          DATABASE_SSL_MODE: require
+        run: uv run alembic upgrade head
+
+  deploy-backend:
+    name: "CD: Deploy backend"
+    needs: [migrate]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: cd-production
+      cancel-in-progress: false
+    permissions:
+      id-token: write # required by azure/login for OIDC
+      contents: read
+      packages: write # required to push to ghcr.io
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged with the commit SHA (for precise, auditable rollback -- see
+      # README "Rollback") as well as `latest` (for convenience/inspection).
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Point the backend Container App at the new image
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          az containerapp update \
+            --name "${{ vars.AZURE_BACKEND_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "ghcr.io/${{ github.repository }}/backend:${{ github.sha }}"
+
+  deploy-frontend:
+    name: "CD: Deploy frontend"
+    needs: [deploy-backend]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: cd-production
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # NEXT_PUBLIC_API_URL must be supplied as a build arg (not just a
+      # runtime container env var): Next.js inlines NEXT_PUBLIC_* values into
+      # the client bundle at build time. See frontend/Dockerfile.prod.
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile.prod
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.BACKEND_PUBLIC_URL }}
+          tags: |
+            ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Point the frontend Container App at the new image
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          az containerapp update \
+            --name "${{ vars.AZURE_FRONTEND_APP_NAME }}" \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --image "ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}"
