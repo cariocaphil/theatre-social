@@ -1,7 +1,10 @@
 name: Bootstrap frontend image
 
-on:
-  workflow_dispatch:
+"on":
+  push:
+    branches:
+      - feature/6-azure-cd
+  workflow_dispatch: {}
 
 jobs:
   build-frontend:
