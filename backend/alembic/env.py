@@ -52,10 +52,15 @@ def do_run_migrations(connection: Connection) -> None:
 async def run_migrations_online() -> None:
     """Run migrations using an async engine, via `run_sync` for the sync API Alembic expects."""
 
+    # Alembic builds its own engine here rather than reusing
+    # `app.db.session.create_engine()`, so the same SSL connect_args must be
+    # applied explicitly -- see that module for why `ssl=...` (not a
+    # `sslmode=...` query param) is the correct mechanism.
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"ssl": get_settings().database_ssl_mode},
     )
 
     async with connectable.connect() as connection:

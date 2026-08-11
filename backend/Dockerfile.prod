@@ -1,0 +1,36 @@
+# Production image for the FastAPI backend (Azure Container Apps).
+#
+# Differs from the dev `Dockerfile` in three ways: no bind-mount/`--reload`
+# assumption (code is COPYd in and is the actual running source, not a
+# fallback baseline), no dev dependency group, and the port is read from
+# `$PORT` at container start so this same image works whether Container Apps
+# ingress targets 8000 (the local-development default, kept as this image's
+# default too) or a different port configured via an Azure app setting.
+
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    PATH="/app/.venv/bin:$PATH"
+
+RUN groupadd --system --gid 1001 app \
+    && useradd --system --uid 1001 --gid app --create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+# `--no-dev`: production image doesn't need ruff/pytest/httpx.
+RUN uv sync --frozen --no-dev
+
+COPY . .
+RUN chown -R app:app /app
+
+USER app
+
+EXPOSE 8000
+
+# Shell form (not exec-form JSON) is required here so `${PORT:-8000}` is
+# expanded by the shell at container start, not treated as a literal string.
+CMD uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

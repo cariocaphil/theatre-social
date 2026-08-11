@@ -1,8 +1,14 @@
 """Application configuration loaded from environment variables."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The exact string values asyncpg's `ssl` connect arg understands (mirrors
+# libpq's sslmode names). See `app/db/session.py` for why this can't just be
+# a `sslmode=...` query parameter on `database_url` instead.
+DatabaseSSLMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
 
 
 class Settings(BaseSettings):
@@ -19,6 +25,12 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     database_url: str = "postgresql+asyncpg://theatre_social:theatre_social_dev_password@postgres:5432/theatre_social"
+    # How the database connection negotiates TLS. "prefer" (the default)
+    # matches the historical, unconfigured behavior against local/CI Postgres
+    # (no SSL, connects in plaintext). Azure Database for PostgreSQL Flexible
+    # Server requires TLS, so production sets this to "require" via an Azure
+    # application setting -- no code change needed between environments.
+    database_ssl_mode: DatabaseSSLMode = "prefer"
 
     # Comma-separated list of allowed CORS origins, e.g. "http://localhost:3000".
     cors_origins: str = "http://localhost:3000"
@@ -43,6 +55,23 @@ class Settings(BaseSettings):
         """
 
         return self.environment != "development"
+
+    @property
+    def session_cookie_samesite(self) -> Literal["lax", "none"]:
+        """Whether the session cookie is sent on cross-site requests.
+
+        Locally, the frontend (`localhost:3000`) and backend (`localhost:8000`)
+        share the same registrable domain ("localhost"), so `Lax` already
+        works fine for the browser's cross-origin `fetch(..., {credentials:
+        "include"})` calls. In production the frontend and backend are on
+        different Azure hostnames, which browsers treat as cross-*site* (not
+        just cross-origin): `Lax` cookies are withheld from those requests
+        entirely, silently breaking auth. `None` fixes that, and requires
+        `Secure`, which `session_cookie_secure` already guarantees together
+        with this (both flip on `environment != "development"`).
+        """
+
+        return "lax" if self.environment == "development" else "none"
 
 
 @lru_cache
