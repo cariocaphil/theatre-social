@@ -35,6 +35,11 @@ automatically on every merge to `main` once CI passes (see [Production
 Deployment](#production-deployment) below). This phase is infrastructure and
 deployment only — no new application functionality.
 
+Phase 7 adds **Engineering Documentation & Agent Instructions**: persistent
+agent guidance (`AGENTS.md`), an architecture document, a development roadmap,
+and lightweight ADR conventions (see [Documentation](#documentation) below).
+Documentation only — no application behavior changes.
+
 ```
 theatre-social/
 ├── frontend/           Next.js (TypeScript, App Router), pnpm
@@ -43,11 +48,26 @@ theatre-social/
 ├── backend/            FastAPI, SQLAlchemy 2 (async), Alembic, uv
 │   ├── Dockerfile        Dev image (bind-mounted source, `--reload`)
 │   └── Dockerfile.prod   Production image (Azure Container Apps)
+├── docs/               Architecture, roadmap, ADR conventions
+├── AGENTS.md           Instructions for coding agents
 ├── .github/workflows/  CI (every push/PR) + CD (main only, after CI passes)
 ├── compose.yml         Postgres + backend + frontend orchestration (local dev only)
 ├── .env.example        Compose-level environment variables
 └── README.md
 ```
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [AGENTS.md](AGENTS.md) | Persistent instructions for coding agents (conventions, workflow, git, security) |
+| [docs/architecture.md](docs/architecture.md) | Current implemented system architecture |
+| [docs/roadmap.md](docs/roadmap.md) | Completed phases (1–6), current Phase 7, proposed future work |
+| [docs/decisions/README.md](docs/decisions/README.md) | When and how to write Architectural Decision Records |
+
+This README remains the operational entry point (run, test, deploy). Architecture
+and roadmap live under `docs/` so they can evolve without duplicating setup
+instructions here.
 
 ## Prerequisites
 
@@ -447,7 +467,7 @@ All four accept/return JSON. `register` returns `201`, `login`/`me` return `200`
 | Name        | `ts_session` | `SESSION_COOKIE_NAME`                                          |
 | `HttpOnly`  | `true`       | always — never readable from JavaScript                       |
 | `Secure`    | environment-dependent | `false` when `ENVIRONMENT=development` (plain HTTP locally), `true` otherwise |
-| `SameSite`  | `Lax`        | always                                                         |
+| `SameSite`  | environment-dependent | `Lax` in development; `None` (with `Secure`) otherwise — required when frontend and backend are on different production hostnames (see [Cross-site session cookie](#cross-site-session-cookie)) |
 | `Path`      | `/`          | always                                                         |
 | `Max-Age`   | 30 days      | `SESSION_LIFETIME_DAYS`                                        |
 
@@ -948,7 +968,7 @@ the app locally.
 | `INTERNAL_API_URL` | frontend (server-side) | Backend URL used by Next.js server-side rendering/fetches | No | Frontend Container App setting |
 | `NEXT_PUBLIC_API_URL` | frontend (browser-side) | Backend URL used by client-side `fetch` calls | No | **Docker build arg** (inlined at build time — see `frontend/Dockerfile.prod`), sourced from the `BACKEND_PUBLIC_URL` GitHub Actions repository variable |
 | `PORT` | both (optional) | Overrides the port each app listens on (defaults: backend `8000`, frontend `3000`) | No | Container App setting, only if the target port ever needs to change |
-| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | CD workflow (`azure/login`) | OIDC federated identity for GitHub Actions → Azure | **Yes** (repo secrets, not disclosed as secret *values*) | GitHub repository secrets |
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | CD workflow (`azure/login`) | OIDC federated identity for GitHub Actions → Azure | No (identifiers, not credentials — OIDC exchanges a short-lived token) | GitHub repository **variables** (see `.github/workflows/ci.yml`) |
 | `AZURE_RESOURCE_GROUP` / `AZURE_BACKEND_APP_NAME` / `AZURE_FRONTEND_APP_NAME` / `BACKEND_PUBLIC_URL` | CD workflow | Names Azure resources to deploy to; backend's public URL for the frontend build | No | GitHub repository **variables** |
 
 Never commit real values for any of the above — `.env.example` files only ever contain
@@ -978,10 +998,10 @@ the libpq-style mode names directly (`disable` / `allow` / `prefer` / `require` 
   no SSL listener that `require`/`True` correctly *fails* (proving it actually enforces
   TLS, not just requesting it opportunistically) while `prefer`/`disable`/`allow`
   succeed. `require` encrypts the connection but does not verify the server's
-  certificate; `verify-full` is a stronger optional upgrade (see
-  [Problems / compromises](#problems--compromises) in the deployment report for this
-  phase, if you have it, or just set `DATABASE_SSL_MODE=verify-full` — the base Python
-  image ships a CA bundle that should chain to Azure's public root CA).
+  certificate; `verify-full` is a stronger optional upgrade (set
+  `DATABASE_SSL_MODE=verify-full` — the base Python image ships a CA bundle that
+  should chain to Azure's public root CA). See also the networking compromise
+  noted under [Configure database networking](#4-configure-database-networking-public-access-mvp-tradeoff).
 
 Covered by `backend/tests/test_config.py` (the setting itself) and
 `backend/tests/test_db_session.py` (that `create_engine()` actually wires it into
@@ -1046,17 +1066,20 @@ and the identity's Azure role assignment is scoped to the `theatre-social-prod`
 resource group only (`Contributor`) — not the subscription.
 
 **Repository changes (already done by this phase):** the CD jobs in `ci.yml`
-reference `${{ secrets.AZURE_CLIENT_ID }}`, `${{ secrets.AZURE_TENANT_ID }}`, `${{
-secrets.AZURE_SUBSCRIPTION_ID }}`, `${{ secrets.PROD_DATABASE_URL }}`, and the
-`${{ vars.* }}` repository variables listed in [Environment
-variables](#environment-variables) above.
+reference `${{ vars.AZURE_CLIENT_ID }}`, `${{ vars.AZURE_TENANT_ID }}`, `${{
+vars.AZURE_SUBSCRIPTION_ID }}`, `${{ secrets.PROD_DATABASE_URL }}`, and the
+other `${{ vars.* }}` repository variables listed in [Environment
+variables](#environment-variables) above. (OIDC identifiers are variables, not
+secrets — commit `0477cd4` aligned the workflow with that layout.)
 
 **GitHub manual configuration (you must do this):**
 1. Create a GitHub Environment named `production` (**Settings → Environments → New
    environment**). Optionally add required reviewers/protection rules here later.
 2. Add repository secrets (**Settings → Secrets and variables → Actions → Secrets**):
-   `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `PROD_DATABASE_URL`.
-3. Add repository variables (same page, **Variables** tab): `AZURE_RESOURCE_GROUP`,
+   `PROD_DATABASE_URL` (the production database URL is the only CD secret required
+   for Azure login + migrate; OIDC uses short-lived tokens, not a stored client secret).
+3. Add repository variables (same page, **Variables** tab): `AZURE_CLIENT_ID`,
+   `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`,
    `AZURE_BACKEND_APP_NAME`, `AZURE_FRONTEND_APP_NAME`, `BACKEND_PUBLIC_URL`.
 
 **Azure/Microsoft Entra manual configuration (you must do this):** see [Manual setup
@@ -1116,8 +1139,9 @@ The CD pipeline's `migrate` job runs `alembic upgrade head` directly from a
 GitHub-hosted runner, which has no fixed IP range Azure can allow-list precisely. For
 this MVP, the firewall allows all public IPs — TLS (`require`) and Postgres
 authentication are still fully enforced, but this is broader network exposure than
-ideal; see [Problems / compromises](#problems--compromises) for the recommended
-follow-up (self-hosted runner, VNet integration, or a Container Apps Job instead).
+ideal. Recommended follow-ups: a self-hosted runner, VNet integration, or a
+Container Apps Job for migrations (see also [docs/roadmap.md](docs/roadmap.md)
+proposed Phase 8 — production hardening).
 
 ```bash
 az postgres flexible-server firewall-rule create \
