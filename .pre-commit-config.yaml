@@ -1,0 +1,23 @@
+# Format staged files on commit. Install once per clone:
+#   uv tool install pre-commit   # or: pipx install pre-commit
+#   pre-commit install
+# Optional: pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff-format
+        files: ^backend/
+
+  # Use the repo's pinned Prettier (frontend/package.json) rather than
+  # mirrors-prettier tags, which lag behind npm Prettier releases.
+  - repo: local
+    hooks:
+      - id: frontend-prettier
+        name: prettier (frontend)
+        language: system
+        files: ^frontend/.*\.(js|jsx|ts|tsx|mjs|cjs|json|css|md|yml|yaml)$
+        exclude: ^(frontend/pnpm-lock\.yaml|frontend/\.next/)
+        entry: bash -c 'cd frontend && pnpm exec prettier --write "${@#frontend/}"' --
+        pass_filenames: true
