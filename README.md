@@ -49,7 +49,7 @@ theatre-social/
 │   ├── Dockerfile        Dev image (bind-mounted source, `--reload`)
 │   └── Dockerfile.prod   Production image (Azure Container Apps)
 ├── docs/               Architecture, roadmap, ADR conventions
-├── AGENTS.md           Instructions for coding agents
+├── AGENTS.md           Root agent rules (package notes under frontend/ and backend/)
 ├── .github/workflows/  CI (every push/PR) + CD (main only, after CI passes)
 ├── compose.yml         Postgres + backend + frontend orchestration (local dev only)
 ├── .env.example        Compose-level environment variables
@@ -60,7 +60,7 @@ theatre-social/
 
 | Document | Purpose |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | Persistent instructions for coding agents (conventions, workflow, git, security) |
+| [AGENTS.md](AGENTS.md) | Root agent rules (invariants, git, verify triggers); package notes in [backend/AGENTS.md](backend/AGENTS.md) and [frontend/AGENTS.md](frontend/AGENTS.md) |
 | [docs/architecture.md](docs/architecture.md) | Current implemented system architecture |
 | [docs/roadmap.md](docs/roadmap.md) | Completed phases (1–6), current Phase 7, proposed future work |
 | [docs/decisions/README.md](docs/decisions/README.md) | When and how to write Architectural Decision Records |
