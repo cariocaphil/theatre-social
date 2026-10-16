@@ -16,14 +16,17 @@ Extends root [AGENTS.md](../AGENTS.md). Open when working under `backend/`.
 
 ## Verify (from `backend/`)
 
-Same checks as the CI backend job:
+Usual check (matches CI lint + test):
 
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run alembic upgrade head   # needs Postgres at DATABASE_URL
 uv run pytest
 ```
 
-New migration: `uv run alembic revision --autogenerate -m "…"` then review before
-upgrade. Recipes: README.
+Run `uv run alembic upgrade head` when the schema changed or the DB may be
+behind (CI always does this on an empty service DB before pytest). Needs
+Postgres at `DATABASE_URL`.
+
+New migration: `uv run alembic revision --autogenerate -m "…"` then review
+before upgrade. Recipes: README.
