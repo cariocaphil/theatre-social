@@ -785,6 +785,20 @@ per [Local development](#local-non-container-development) above, or via
 `podman compose exec backend ...` / `podman compose exec frontend ...` against the
 running containers).
 
+### Git hooks (pre-commit)
+
+Formatting also runs automatically on commit for staged files (Ruff for
+`backend/`, Prettier for `frontend/`). One-time setup per clone:
+
+```bash
+uv tool install pre-commit   # or: pipx install pre-commit
+pre-commit install
+```
+
+Config: [`.pre-commit-config.yaml`](.pre-commit-config.yaml). Optional:
+`pre-commit run --all-files` to format the whole tree. Hooks only format; CI
+still runs the full lint/test/build gates below.
+
 ### Backend (from `backend/`)
 
 ```bash

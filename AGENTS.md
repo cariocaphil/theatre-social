@@ -92,6 +92,10 @@ commit/push/force-push/rebase/amend/open a PR unless the user asks in that turn.
 
 Do not stage or touch changes you did not make (leave unrelated local edits alone).
 
+After `pre-commit install` (see README), commits auto-format staged backend
+(Ruff) and frontend (Prettier) files via [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+Do not use `--no-verify` to skip formatting unless the user explicitly asks.
+
 When asked to commit: conventional commits — `<type>: <subject>` (≤~72 chars,
 imperative). Types:
 
