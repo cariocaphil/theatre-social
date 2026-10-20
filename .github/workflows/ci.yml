@@ -131,13 +131,21 @@ jobs:
   # deployment instead of racing ahead of it. Nothing here repeats the
   # lint/type-check/test/build work those jobs already did.
   #
-  # Flow: migrate (Alembic against the production DB) -> deploy-backend
-  # (build/push image, update the Container App) -> deploy-frontend (same,
-  # but also needs the backend's public URL as a build arg). See the
-  # README's "Production Deployment" section for the full picture, including
-  # the one-time Azure/GitHub setup this depends on (OIDC federation, the
-  # `AZURE_*` secrets, and the `AZURE_*` / `BACKEND_PUBLIC_URL` variables
-  # referenced below).
+  # Flow: migrate -> deploy-backend -> deploy-frontend -> smoke-test.
+  # Mutating CD jobs (migrate/deploy-*) share concurrency group cd-production
+  # for cross-run serialization. smoke-test is read-only and deliberately
+  # outside that group; it is gated only by needs: [deploy-frontend].
+  # See README "Production Deployment" for Azure/GitHub setup (OIDC, vars).
+  smoke-script:
+    name: Smoke script tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Test smoke-prod.sh against a mock HTTP server
+        run: python3 scripts/test_smoke_prod.py
+
   migrate:
     name: "CD: Database migration"
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -292,3 +300,22 @@ jobs:
             --name "${{ vars.AZURE_FRONTEND_APP_NAME }}" \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --image "ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}"
+
+  # Read-only post-deploy verification against public URLs. Success of
+  # `az containerapp update` is not enough: this job proves the live apps
+  # answer health/API/frontend requests. No cd-production concurrency —
+  # see comment above migrate.
+  smoke-test:
+    name: "CD: Post-deployment smoke"
+    needs: [deploy-frontend]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      BACKEND_PUBLIC_URL: ${{ vars.BACKEND_PUBLIC_URL }}
+      FRONTEND_PUBLIC_URL: ${{ vars.FRONTEND_PUBLIC_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Smoke-test deployed backend and frontend
+        run: bash scripts/smoke-prod.sh

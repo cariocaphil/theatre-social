@@ -933,18 +933,22 @@ the app locally.
                  GitHub Actions
               CI (every push/PR) ──► CD (main only, after CI)
                        │                        │
-          ┌────────────┴──────────┐   migrate → deploy-backend → deploy-frontend
-          │                       │             │                │
-          ▼                       ▼             ▼                ▼
-    Next.js frontend        FastAPI backend   Alembic          images pushed to
-   Azure Container App     Azure Container App  upgrade         ghcr.io, then
-                       │                │        head        `az containerapp update`
+          ┌────────────┴──────────┐   migrate → deploy-backend → deploy-frontend → smoke-test
+          │                       │             │                │                  │
+          ▼                       ▼             ▼                ▼                  ▼
+    Next.js frontend        FastAPI backend   Alembic          images updated    public HTTP
+   Azure Container App     Azure Container App  upgrade         via `az …`        checks
+                       │                │        head
                        │   HTTPS API    │
                        └───────────────►│
                                         ▼
                           Azure Database for PostgreSQL
                                 Flexible Server
 ```
+
+A successful `az containerapp update` means Azure accepted the new image revision —
+**not** that the live app is healthy. The `smoke-test` job is the post-deployment
+verification gate (see [Automated post-deployment smoke](#automated-post-deployment-smoke)).
 
 ### Architecture and why
 
@@ -954,7 +958,7 @@ the app locally.
 | Backend hosting | Azure Container Apps | FastAPI/Uvicorn is already containerized; Container Apps' consumption plan can **scale to zero**, unlike App Service's Basic/Standard plans (billed 24/7 regardless of traffic) — important for an MVP with ~no traffic. Using the same hosting model as the frontend also halves the number of deployment mechanisms to operate and document. |
 | Container registry | GitHub Container Registry (`ghcr.io`) | Avoids an extra ~$5/mo Azure Container Registry resource; images stay registry-agnostic (portable to any other host later). |
 | Database | Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, single zone | Cheapest general-purpose PostgreSQL tier suitable for an MVP; no HA/multi-zone, consistent with "cost visibility over premature scalability". |
-| CI/CD | Existing `ci.yml`, extended with `migrate` / `deploy-backend` / `deploy-frontend` jobs | Reuses the existing quality gate instead of a second parallel workflow; `needs:` makes a failed lint/test/build block deployment without repeating that work. |
+| CI/CD | Existing `ci.yml`, extended with `migrate` / `deploy-*` / `smoke-test` jobs | Reuses the existing quality gate; `needs:` chains deploy then read-only smoke against public URLs. |
 | Azure auth | OIDC via `azure/login`, no stored client secret | No long-lived credential to leak or rotate; federated credential is scoped to this repo's `production` GitHub Environment. |
 | Migrations | `alembic upgrade head` as a CD step, before either app is deployed | Simplest reliable option — no Container Apps Jobs, no custom orchestration. |
 
@@ -983,7 +987,9 @@ the app locally.
 | `NEXT_PUBLIC_API_URL` | frontend (browser-side) | Backend URL used by client-side `fetch` calls | No | **Docker build arg** (inlined at build time — see `frontend/Dockerfile.prod`), sourced from the `BACKEND_PUBLIC_URL` GitHub Actions repository variable |
 | `PORT` | both (optional) | Overrides the port each app listens on (defaults: backend `8000`, frontend `3000`) | No | Container App setting, only if the target port ever needs to change |
 | `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | CD workflow (`azure/login`) | OIDC federated identity for GitHub Actions → Azure | No (identifiers, not credentials — OIDC exchanges a short-lived token) | GitHub repository **variables** (see `.github/workflows/ci.yml`) |
-| `AZURE_RESOURCE_GROUP` / `AZURE_BACKEND_APP_NAME` / `AZURE_FRONTEND_APP_NAME` / `BACKEND_PUBLIC_URL` | CD workflow | Names Azure resources to deploy to; backend's public URL for the frontend build | No | GitHub repository **variables** |
+| `AZURE_RESOURCE_GROUP` / `AZURE_BACKEND_APP_NAME` / `AZURE_FRONTEND_APP_NAME` | CD workflow | Names Azure resources to deploy to | No | GitHub repository **variables** |
+| `BACKEND_PUBLIC_URL` | CD (frontend image build + smoke) | Public HTTPS origin of the backend Container App | No | GitHub repository **variable** |
+| `FRONTEND_PUBLIC_URL` | CD smoke-test | Public HTTPS origin of the frontend Container App | No | GitHub repository **variable** |
 
 Never commit real values for any of the above — `.env.example` files only ever contain
 placeholders (see `backend/.env.example` and `frontend/.env.example` for the exact
@@ -1044,30 +1050,34 @@ Pull Request / any push
   └── backend    (lint, format check, migrate-from-empty, test)
 ```
 
-Pushing to `main` runs those two jobs exactly as before, **plus** three more that only
-run for `main` pushes (`if: github.ref == 'refs/heads/main' && github.event_name ==
-'push'`) and only after both succeed (`needs: [frontend, backend]`):
+Every push/PR also runs a `smoke-script` job that exercises `scripts/smoke-prod.sh`
+against a local mock HTTP server (no Azure). Pushing to `main` additionally runs CD
+jobs after `frontend`/`backend` succeed (`needs: [frontend, backend]` on `migrate`):
 
 ```text
 push to main
   ├── frontend ──┐
-  └── backend  ──┤
+  ├── backend  ──┤
+  └── smoke-script (mock tests; parallel, not on the CD critical path)
                  ▼
               migrate            (alembic upgrade head, against Azure Postgres)
                  ▼
            deploy-backend        (build+push image, az containerapp update)
                  ▼
            deploy-frontend       (build+push image, az containerapp update)
+                 ▼
+             smoke-test          (public HTTP checks; fails the workflow if unhealthy)
 ```
 
-- A failed `frontend`/`backend` job — or a failed `migrate`/`deploy-*` step — stops the
-  chain there; nothing downstream runs, and the failure is visible directly in the
-  GitHub Actions run.
-- All three CD jobs share `concurrency: { group: cd-production, cancel-in-progress:
-  false }`, so a second push to `main` while a deploy is in flight queues behind it
-  instead of racing it.
+- A failed `frontend`/`backend` job — or a failed `migrate`/`deploy-*`/`smoke-test`
+  step — stops the chain there; nothing downstream runs, and the failure is visible
+  directly in the GitHub Actions run.
+- Mutating CD jobs (`migrate`, `deploy-backend`, `deploy-frontend`) share
+  `concurrency: { group: cd-production, cancel-in-progress: false }` so overlapping
+  pushes to `main` cannot mutate Azure in parallel. **`smoke-test` is outside that
+  group** (read-only public GETs; gated only by `needs: [deploy-frontend]`).
 - Nothing in the CD jobs repeats the frontend/backend lint/type-check/test/build work —
-  they only build the already-tested code into a container image.
+  they only build the already-tested code into a container image, then smoke-verify.
 - Feature branches and pull requests never reach the CD jobs at all (the `if` guard on
   `migrate`).
 
@@ -1094,7 +1104,8 @@ secrets — commit `0477cd4` aligned the workflow with that layout.)
    for Azure login + migrate; OIDC uses short-lived tokens, not a stored client secret).
 3. Add repository variables (same page, **Variables** tab): `AZURE_CLIENT_ID`,
    `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`,
-   `AZURE_BACKEND_APP_NAME`, `AZURE_FRONTEND_APP_NAME`, `BACKEND_PUBLIC_URL`.
+   `AZURE_BACKEND_APP_NAME`, `AZURE_FRONTEND_APP_NAME`, `BACKEND_PUBLIC_URL`,
+   `FRONTEND_PUBLIC_URL`.
 
 **Azure/Microsoft Entra manual configuration (you must do this):** see [Manual setup
 guide](#manual-setup-guide) below for the exact commands — creating the App
@@ -1248,6 +1259,7 @@ az containerapp create \
 
 az containerapp show --name theatre-social-frontend --resource-group theatre-social-prod \
   --query properties.configuration.ingress.fqdn -o tsv
+# -> note this as FRONTEND_PUBLIC_URL, prefixed with "https://"
 ```
 
 **8. Point the backend's CORS at the real frontend URL**
@@ -1297,11 +1309,13 @@ DATABASE_URL="<PROD_DATABASE_URL>" DATABASE_SSL_MODE=require uv run python -m ap
 **12. Trigger production deployment**
 
 Merge a pull request into `main` (or push directly). Watch the `migrate` /
-`deploy-backend` / `deploy-frontend` jobs in the **Actions** tab.
+`deploy-backend` / `deploy-frontend` / `smoke-test` jobs in the **Actions** tab.
 
 **13. Run the smoke tests**
 
-See [Production smoke testing](#production-smoke-testing) below.
+After CD includes `smoke-test`, a green Actions run already covers automated
+checks once `FRONTEND_PUBLIC_URL` is set. Also run the manual auth/diary items in
+[Production smoke testing (manual)](#production-smoke-testing-manual) when needed.
 
 ### Database migrations
 
@@ -1403,16 +1417,37 @@ Normal flow: open a PR → CI runs → merge to `main` → CD runs automatically
   **different operations** — rolling back the app never implies rolling back the
   database, and vice versa.
 
-### Production smoke testing
+### Automated post-deployment smoke
 
-After any deployment, verify manually (or via `curl`/browser):
+After both Container Apps are updated, the `smoke-test` CD job runs
+[`scripts/smoke-prod.sh`](scripts/smoke-prod.sh) against the **public** origins in
+`BACKEND_PUBLIC_URL` and `FRONTEND_PUBLIC_URL` (never localhost). It checks, in order:
 
-1. Frontend loads publicly at its Container App URL.
-2. `GET /health` on the backend URL returns `200`.
+1. `GET /health` → HTTP 200 and `status == "ok"` and `database == "connected"`
+2. `GET /api/v1/productions` → HTTP 200 and a typed page
+   (`items` array, numeric `total` / `limit` / `offset`)
+3. `GET /` on the frontend → HTTP 200
+
+Retries are bounded (default 12 attempts, 10s apart; override with
+`SMOKE_MAX_ATTEMPTS` / `SMOKE_SLEEP_SECONDS`). Any remaining failure fails the
+workflow. The script’s own behavior is covered by `python3 scripts/test_smoke_prod.py`
+(CI job `smoke-script` on every push/PR).
+
+**Deploy vs verify:** `az containerapp update` succeeding only means Azure accepted
+the revision. The smoke job is what verifies the newly deployed apps are serving
+healthy responses.
+
+### Production smoke testing (manual)
+
+Automated smoke is intentionally **read-only** and does not cover auth or diary.
+After any deployment, also verify manually when exercising those flows:
+
+1. Frontend loads publicly at its Container App URL (also covered by automated smoke).
+2. `GET /health` on the backend URL returns `200` with `ok` / `connected` (automated).
 3. (implied by #2) backend successfully reached Azure PostgreSQL.
 4. `alembic current` (run locally against `PROD_DATABASE_URL`) matches the latest
    revision in `backend/alembic/versions/`.
-5. `/productions` loads the catalogue.
+5. `/productions` loads the catalogue (list API covered by automated smoke).
 6. Register a new account.
 7. Log in with it.
 8. Refresh the page — still logged in (`/me` persists).
@@ -1427,18 +1462,12 @@ After any deployment, verify manually (or via `curl`/browser):
     first user's diary entry via the API is rejected (401/404, matching existing
     ownership rules).
 17. Redeploy (push a trivial change to `main`) — the app is still fully functional
-    afterwards.
+    afterwards, including a green `smoke-test` job.
 
 *(This list intentionally excludes "rewatch flag", "tags", and "private flag" from the
 original Phase 6 prompt's checklist template — those fields don't exist on
 `DiaryEntry`; see [Production Logging & Diary](#production-logging--diary) above for
 the actual fields Phase 5 implemented: `watched_at`, `rating`, `review`.)*
-
-**I have not deployed this to a real Azure subscription** (no Azure account/credentials
-are available in this environment), so every item above is reported as **NOT TESTED**
-in this phase's final report rather than claimed as passing — see that report for the
-full, honest breakdown, and re-run this checklist yourself after following the [Manual
-setup guide](#manual-setup-guide).
 
 ### Costs
 

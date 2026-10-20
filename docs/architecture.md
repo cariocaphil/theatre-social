@@ -57,8 +57,11 @@ flowchart TD
   CI -->|"push to main + CI green"| Mig["migrate: alembic upgrade head"]
   Mig --> DBE["Deploy backend image to Container Apps"]
   DBE --> DFE["Deploy frontend image to Container Apps"]
+  DFE --> Smoke["smoke-test: health, productions, frontend"]
   DBE --> ACA_BE["Azure Container App: backend"]
   DFE --> ACA_FE["Azure Container App: frontend"]
+  Smoke --> ACA_BE
+  Smoke --> ACA_FE
   ACA_BE --> PG["Azure PostgreSQL Flexible Server"]
 ```
 
@@ -222,14 +225,21 @@ Single workflow file: `.github/workflows/ci.yml`.
 | Job | When | Role |
 | --- | --- | --- |
 | `frontend` / `backend` | Every push/PR to `main` | Quality gate |
+| `smoke-script` | Every push/PR | Mock-HTTP tests for `scripts/smoke-prod.sh` |
 | `migrate` | Push to `main` after CI | `alembic upgrade head` against `PROD_DATABASE_URL` |
 | `deploy-backend` | After migrate | Build/push `Dockerfile.prod` → `az containerapp update` |
 | `deploy-frontend` | After backend deploy | Same; `NEXT_PUBLIC_API_URL` from `BACKEND_PUBLIC_URL` |
+| `smoke-test` | After frontend deploy | Sequential public GETs: `/health`, `/api/v1/productions`, frontend `/` |
+
+Mutating CD jobs share concurrency group `cd-production`; `smoke-test` does not
+(read-only; gated by `needs` only). Deploy CLI success ≠ verified serving — smoke
+is the verification gate.
 
 Azure login uses OIDC (`azure/login`) with:
 
 - `vars.AZURE_CLIENT_ID`, `vars.AZURE_TENANT_ID`, `vars.AZURE_SUBSCRIPTION_ID`
 - `secrets.PROD_DATABASE_URL` for migrations
+- `vars.BACKEND_PUBLIC_URL` / `vars.FRONTEND_PUBLIC_URL` for smoke (and frontend build)
 
 Operational detail (resource names, manual Azure setup, costs, rollback) lives
 in the README [Production Deployment](../README.md#production-deployment)
