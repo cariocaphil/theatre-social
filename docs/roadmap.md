@@ -116,18 +116,28 @@ phases above.
 **Objective:** Make the Azure deployment safer and easier to operate without
 changing product features.
 
-**Candidate scope:**
+**Done (partial):** automated post-deployment smoke (`ci/9-post-deployment-smoke-tests`
+/ PR 9) — CD job `smoke-test` runs read-only public checks (`/health`,
+`/api/v1/productions`, frontend `/`) after both Container Apps update; mock tests
+for `scripts/smoke-prod.sh` run on every CI push/PR.
 
+**Still proposed:**
+
+- Serialize complete production deployment sequences across workflow runs
+  (migrations, backend deployment, frontend deployment, and post-deployment
+  smoke verification) so overlapping pushes to `main` cannot interleave CD
+  jobs or leave smoke checking another run’s revision.
 - Tighten Postgres network exposure (replace “allow all” firewall if still in
   use; prefer runner/job with constrained access for migrations).
 - Optional `DATABASE_SSL_MODE=verify-full` validation against Azure.
-- Confirm/document live smoke-test checklist after real deploys.
+- Confirm the manual auth/diary smoke checklist against a live subscription.
 - Minimal structured logging / optional Application Insights (docs-first if
   code changes stay tiny).
 
 **Dependencies:** Phase 6 deployment machinery.  
 **Completion criteria:** Documented production access path with fewer MVP
-security compromises; smoke tests executed and recorded.  
+security compromises; automated smoke green on real deploys; remaining hardening
+items above addressed or explicitly deferred.  
 **Priority:** High (stabilizes everything else that ships to production).
 
 ### Proposed Phase 9 — Catalogue curation & data quality

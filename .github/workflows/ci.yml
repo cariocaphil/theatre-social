@@ -131,21 +131,38 @@ jobs:
   # deployment instead of racing ahead of it. Nothing here repeats the
   # lint/type-check/test/build work those jobs already did.
   #
-  # Flow: migrate (Alembic against the production DB) -> deploy-backend
-  # (build/push image, update the Container App) -> deploy-frontend (same,
-  # but also needs the backend's public URL as a build arg). See the
-  # README's "Production Deployment" section for the full picture, including
-  # the one-time Azure/GitHub setup this depends on (OIDC federation, the
-  # `AZURE_*` secrets, and the `AZURE_*` / `BACKEND_PUBLIC_URL` variables
-  # referenced below).
+  # Flow: migrate -> deploy-backend -> deploy-frontend -> smoke-test.
+  #
+  # Job-level concurrency (cd-production on migrate/deploy-*): at most one of
+  # those jobs runs at a time across workflow runs, with cancel-in-progress:
+  # false. That does NOT serialize a full deploy sequence (migrate through
+  # smoke) per run — two pushes to main can still interleave CD jobs (e.g. run
+  # B's migrate while run A is in deploy-frontend or smoke-test).
+  #
+  # smoke-test stays outside cd-production: it is read-only public GETs and
+  # must not contend for the mutating-job lock; it is gated only by
+  # needs: [deploy-frontend]. See README / roadmap Phase 8 for the known
+  # limitation and future hardening.
+  # See README "Production Deployment" for Azure/GitHub setup (OIDC, vars).
+  smoke-script:
+    name: Smoke script tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Test smoke-prod.sh against a mock HTTP server
+        run: python3 scripts/test_smoke_prod.py
+
   migrate:
     name: "CD: Database migration"
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [frontend, backend]
     runs-on: ubuntu-latest
     environment: production
-    # Shared across all three CD jobs: a second push to main while a deploy
-    # is in flight queues behind it rather than racing it or being dropped.
+    # Shared with deploy-backend / deploy-frontend only (not smoke-test).
+    # Serializes individual mutating jobs, not whole CD sequences — see the
+    # Continuous Delivery comment block above.
     concurrency:
       group: cd-production
       cancel-in-progress: false
@@ -292,3 +309,24 @@ jobs:
             --name "${{ vars.AZURE_FRONTEND_APP_NAME }}" \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --image "ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}"
+
+  # Read-only post-deploy verification against public URLs. Success of
+  # `az containerapp update` is not enough: this job proves the live apps
+  # answer health/API/frontend requests. Deliberately outside cd-production
+  # (read-only; must not hold the mutating-job lock). Consequence: smoke for
+  # run A can observe an environment already changed by run B — see CD
+  # comment block above and README.
+  smoke-test:
+    name: "CD: Post-deployment smoke"
+    needs: [deploy-frontend]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      BACKEND_PUBLIC_URL: ${{ vars.BACKEND_PUBLIC_URL }}
+      FRONTEND_PUBLIC_URL: ${{ vars.FRONTEND_PUBLIC_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Smoke-test deployed backend and frontend
+        run: bash scripts/smoke-prod.sh
