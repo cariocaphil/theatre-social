@@ -132,9 +132,17 @@ jobs:
   # lint/type-check/test/build work those jobs already did.
   #
   # Flow: migrate -> deploy-backend -> deploy-frontend -> smoke-test.
-  # Mutating CD jobs (migrate/deploy-*) share concurrency group cd-production
-  # for cross-run serialization. smoke-test is read-only and deliberately
-  # outside that group; it is gated only by needs: [deploy-frontend].
+  #
+  # Job-level concurrency (cd-production on migrate/deploy-*): at most one of
+  # those jobs runs at a time across workflow runs, with cancel-in-progress:
+  # false. That does NOT serialize a full deploy sequence (migrate through
+  # smoke) per run — two pushes to main can still interleave CD jobs (e.g. run
+  # B's migrate while run A is in deploy-frontend or smoke-test).
+  #
+  # smoke-test stays outside cd-production: it is read-only public GETs and
+  # must not contend for the mutating-job lock; it is gated only by
+  # needs: [deploy-frontend]. See README / roadmap Phase 8 for the known
+  # limitation and future hardening.
   # See README "Production Deployment" for Azure/GitHub setup (OIDC, vars).
   smoke-script:
     name: Smoke script tests
@@ -152,8 +160,9 @@ jobs:
     needs: [frontend, backend]
     runs-on: ubuntu-latest
     environment: production
-    # Shared across all three CD jobs: a second push to main while a deploy
-    # is in flight queues behind it rather than racing it or being dropped.
+    # Shared with deploy-backend / deploy-frontend only (not smoke-test).
+    # Serializes individual mutating jobs, not whole CD sequences — see the
+    # Continuous Delivery comment block above.
     concurrency:
       group: cd-production
       cancel-in-progress: false
@@ -303,8 +312,10 @@ jobs:
 
   # Read-only post-deploy verification against public URLs. Success of
   # `az containerapp update` is not enough: this job proves the live apps
-  # answer health/API/frontend requests. No cd-production concurrency —
-  # see comment above migrate.
+  # answer health/API/frontend requests. Deliberately outside cd-production
+  # (read-only; must not hold the mutating-job lock). Consequence: smoke for
+  # run A can observe an environment already changed by run B — see CD
+  # comment block above and README.
   smoke-test:
     name: "CD: Post-deployment smoke"
     needs: [deploy-frontend]

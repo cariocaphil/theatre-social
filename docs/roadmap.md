@@ -123,6 +123,10 @@ for `scripts/smoke-prod.sh` run on every CI push/PR.
 
 **Still proposed:**
 
+- Serialize complete production deployment sequences across workflow runs
+  (migrations, backend deployment, frontend deployment, and post-deployment
+  smoke verification) so overlapping pushes to `main` cannot interleave CD
+  jobs or leave smoke checking another run’s revision.
 - Tighten Postgres network exposure (replace “allow all” firewall if still in
   use; prefer runner/job with constrained access for migrations).
 - Optional `DATABASE_SSL_MODE=verify-full` validation against Azure.

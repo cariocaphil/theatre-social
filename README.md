@@ -1073,9 +1073,14 @@ push to main
   step — stops the chain there; nothing downstream runs, and the failure is visible
   directly in the GitHub Actions run.
 - Mutating CD jobs (`migrate`, `deploy-backend`, `deploy-frontend`) share
-  `concurrency: { group: cd-production, cancel-in-progress: false }` so overlapping
-  pushes to `main` cannot mutate Azure in parallel. **`smoke-test` is outside that
-  group** (read-only public GETs; gated only by `needs: [deploy-frontend]`).
+  `concurrency: { group: cd-production, cancel-in-progress: false }`. That
+  serializes those **individual** jobs so two of them never run at once, but it
+  does **not** serialize a complete deployment sequence across workflow runs —
+  two pushes to `main` can still interleave (e.g. run B migrates while run A is
+  still deploying or smoking). **`smoke-test` is outside that group** (read-only
+  public GETs; gated only by `needs: [deploy-frontend]`), so smoke for one run
+  may verify an environment already touched by another. Full-sequence
+  serialization is a future hardening item (roadmap Phase 8).
 - Nothing in the CD jobs repeats the frontend/backend lint/type-check/test/build work —
   they only build the already-tested code into a container image, then smoke-verify.
 - Feature branches and pull requests never reach the CD jobs at all (the `if` guard on

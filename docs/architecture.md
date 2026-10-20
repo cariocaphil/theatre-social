@@ -231,9 +231,10 @@ Single workflow file: `.github/workflows/ci.yml`.
 | `deploy-frontend` | After backend deploy | Same; `NEXT_PUBLIC_API_URL` from `BACKEND_PUBLIC_URL` |
 | `smoke-test` | After frontend deploy | Sequential public GETs: `/health`, `/api/v1/productions`, frontend `/` |
 
-Mutating CD jobs share concurrency group `cd-production`; `smoke-test` does not
-(read-only; gated by `needs` only). Deploy CLI success ≠ verified serving — smoke
-is the verification gate.
+Mutating CD jobs share concurrency group `cd-production` (individual jobs, not
+whole sequences across runs); `smoke-test` does not (read-only; gated by
+`needs` only). Deploy CLI success ≠ verified serving — smoke is the verification
+gate. Full-sequence serialization is roadmap Phase 8.
 
 Azure login uses OIDC (`azure/login`) with:
 
