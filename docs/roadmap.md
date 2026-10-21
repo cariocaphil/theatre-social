@@ -116,17 +116,21 @@ phases above.
 **Objective:** Make the Azure deployment safer and easier to operate without
 changing product features.
 
-**Done (partial):** automated post-deployment smoke (`ci/9-post-deployment-smoke-tests`
-/ PR 9) — CD job `smoke-test` runs read-only public checks (`/health`,
-`/api/v1/productions`, frontend `/`) after both Container Apps update; mock tests
-for `scripts/smoke-prod.sh` run on every CI push/PR.
+**Done:**
+
+- Automated post-deployment smoke (`ci/9-post-deployment-smoke-tests` / PR 9) —
+  CD job `smoke-test` runs read-only public checks (`/health`,
+  `/api/v1/productions`, frontend `/`) after both Container Apps update; mock
+  tests for `scripts/smoke-prod.sh` run on every CI push/PR.
+- Production deployment serialization (`ci/10-serialize-production-deployments`
+  / PR 10) — workflow-level concurrency on `main` keeps one full sequence
+  (migrate → deploy-backend → deploy-frontend → smoke-test, including preceding
+  CI) from being cancelled mid-flight; job-level `cd-production` including smoke
+  is limited defense in depth. Pending main runs can still be replaced (not every
+  commit necessarily deploys).
 
 **Still proposed:**
 
-- Serialize complete production deployment sequences across workflow runs
-  (migrations, backend deployment, frontend deployment, and post-deployment
-  smoke verification) so overlapping pushes to `main` cannot interleave CD
-  jobs or leave smoke checking another run’s revision.
 - Tighten Postgres network exposure (replace “allow all” firewall if still in
   use; prefer runner/job with constrained access for migrations).
 - Optional `DATABASE_SSL_MODE=verify-full` validation against Azure.

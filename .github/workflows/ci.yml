@@ -6,13 +6,14 @@ on:
   pull_request:
     branches: [main]
 
-# Cancel superseded runs for the same branch/PR so pushes don't queue up stale CI runs.
-# Deliberately NOT applied to the deploy jobs below (see their own concurrency
-# group): a deploy that's already touching production must run to completion
-# rather than being cancelled mid-way by the next push to main.
+# PRs: cancel superseded CI for the same ref.
+# main pushes: do not cancel an in-flight run (CI through smoke). Newer main
+# pushes wait. Default concurrency: at most one pending; a newer pending run
+# replaces an older pending one — not every commit is necessarily deployed.
+# This workflow-level group is the primary serialization for full main runs.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   frontend:
@@ -133,23 +134,32 @@ jobs:
   #
   # Flow: migrate -> deploy-backend -> deploy-frontend -> smoke-test.
   #
-  # Job-level concurrency (cd-production on migrate/deploy-*): at most one of
-  # those jobs runs at a time across workflow runs, with cancel-in-progress:
-  # false. That does NOT serialize a full deploy sequence (migrate through
-  # smoke) per run — two pushes to main can still interleave CD jobs (e.g. run
-  # B's migrate while run A is in deploy-frontend or smoke-test).
+  # Primary serialization is workflow-level concurrency on main (see top of
+  # file): at most one main run is active through CI and this entire CD chain.
   #
-  # smoke-test stays outside cd-production: it is read-only public GETs and
-  # must not contend for the mutating-job lock; it is gated only by
-  # needs: [deploy-frontend]. See README / roadmap Phase 8 for the known
-  # limitation and future hardening.
+  # Job-level cd-production (migrate / deploy-* / smoke-test) is limited
+  # defense in depth: at most one of those individual jobs runs at a time
+  # across runs. It cannot keep a full migrate→…→smoke sequence uninterrupted
+  # if workflow-level serialization is removed — jobs from different runs can
+  # still take turns on the lock and interleave. Workflow group (ci-…) and
+  # job group (cd-production) use different names so cancel policies do not
+  # clash. Within one run, needs: orders acquisition of the job lock.
   # See README "Production Deployment" for Azure/GitHub setup (OIDC, vars).
+  #
+  # smoke-script (below) is not CD — it runs on every push/PR with no if:
+  # guard so actionlint and mock smoke tests gate workflow changes before merge.
   smoke-script:
-    name: Smoke script tests
+    name: Smoke script + actionlint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Lint GitHub Actions workflows
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
+        shell: bash
 
       - name: Test smoke-prod.sh against a mock HTTP server
         run: python3 scripts/test_smoke_prod.py
@@ -160,8 +170,8 @@ jobs:
     needs: [frontend, backend]
     runs-on: ubuntu-latest
     environment: production
-    # Shared with deploy-backend / deploy-frontend only (not smoke-test).
-    # Serializes individual mutating jobs, not whole CD sequences — see the
+    # Shared with deploy-backend / deploy-frontend / smoke-test. Prevents
+    # overlapping individual production jobs; not a full-sequence lock — see
     # Continuous Delivery comment block above.
     concurrency:
       group: cd-production
@@ -312,15 +322,16 @@ jobs:
 
   # Read-only post-deploy verification against public URLs. Success of
   # `az containerapp update` is not enough: this job proves the live apps
-  # answer health/API/frontend requests. Deliberately outside cd-production
-  # (read-only; must not hold the mutating-job lock). Consequence: smoke for
-  # run A can observe an environment already changed by run B — see CD
-  # comment block above and README.
+  # answer health/API/frontend requests. Shares cd-production with migrate /
+  # deploy-* as limited defense in depth (see CD comment block above).
   smoke-test:
     name: "CD: Post-deployment smoke"
     needs: [deploy-frontend]
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: cd-production
+      cancel-in-progress: false
     env:
       BACKEND_PUBLIC_URL: ${{ vars.BACKEND_PUBLIC_URL }}
       FRONTEND_PUBLIC_URL: ${{ vars.FRONTEND_PUBLIC_URL }}

@@ -1072,19 +1072,28 @@ push to main
 - A failed `frontend`/`backend` job — or a failed `migrate`/`deploy-*`/`smoke-test`
   step — stops the chain there; nothing downstream runs, and the failure is visible
   directly in the GitHub Actions run.
-- Mutating CD jobs (`migrate`, `deploy-backend`, `deploy-frontend`) share
-  `concurrency: { group: cd-production, cancel-in-progress: false }`. That
-  serializes those **individual** jobs so two of them never run at once, but it
-  does **not** serialize a complete deployment sequence across workflow runs —
-  two pushes to `main` can still interleave (e.g. run B migrates while run A is
-  still deploying or smoking). **`smoke-test` is outside that group** (read-only
-  public GETs; gated only by `needs: [deploy-frontend]`), so smoke for one run
-  may verify an environment already touched by another. Full-sequence
-  serialization is a future hardening item (roadmap Phase 8).
+- **Primary serialization (workflow-level):** on `push` to `main`, concurrency
+  uses `cancel-in-progress: false` so an in-flight run (frontend/backend CI
+  through `smoke-test`) is not cancelled. At most one main run is active at a
+  time. Pull requests still cancel superseded CI for the same ref.
+- **Pending runs are not a FIFO queue:** GitHub keeps at most one pending run
+  per concurrency group by default; a newer pending run **replaces** an older
+  one. Intermediate commits on `main` are **not** necessarily deployed.
+- **Trade-off:** serializing entire main workflows delays **CI as well as CD**
+  while a deploy/smoke is in flight. Acceptable at current scale (low push rate,
+  single production env); a split CI/CD workflow remains a future option if main
+  CI latency matters.
+- **Job-level `cd-production`** (`migrate`, `deploy-backend`, `deploy-frontend`,
+  `smoke-test`, `cancel-in-progress: false`) is limited defense in depth: it
+  prevents those **individual** production jobs from overlapping. It cannot keep
+  a full migrate→…→smoke **sequence** uninterrupted if workflow-level
+  serialization is removed — jobs from different runs can still take turns on
+  the lock and interleave.
 - Nothing in the CD jobs repeats the frontend/backend lint/type-check/test/build work —
   they only build the already-tested code into a container image, then smoke-verify.
 - Feature branches and pull requests never reach the CD jobs at all (the `if` guard on
-  `migrate`).
+  `migrate`). The `smoke-script` job (mock smoke tests + actionlint) runs on every
+  push/PR with no `if:` guard so workflow changes are linted before merge.
 
 ### Azure OIDC authentication
 

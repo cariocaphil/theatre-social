@@ -225,16 +225,20 @@ Single workflow file: `.github/workflows/ci.yml`.
 | Job | When | Role |
 | --- | --- | --- |
 | `frontend` / `backend` | Every push/PR to `main` | Quality gate |
-| `smoke-script` | Every push/PR | Mock-HTTP tests for `scripts/smoke-prod.sh` |
+| `smoke-script` | Every push/PR (no `if:`) | Mock-HTTP tests for `scripts/smoke-prod.sh` + actionlint on workflows |
 | `migrate` | Push to `main` after CI | `alembic upgrade head` against `PROD_DATABASE_URL` |
 | `deploy-backend` | After migrate | Build/push `Dockerfile.prod` → `az containerapp update` |
 | `deploy-frontend` | After backend deploy | Same; `NEXT_PUBLIC_API_URL` from `BACKEND_PUBLIC_URL` |
 | `smoke-test` | After frontend deploy | Sequential public GETs: `/health`, `/api/v1/productions`, frontend `/` |
 
-Mutating CD jobs share concurrency group `cd-production` (individual jobs, not
-whole sequences across runs); `smoke-test` does not (read-only; gated by
-`needs` only). Deploy CLI success ≠ verified serving — smoke is the verification
-gate. Full-sequence serialization is roadmap Phase 8.
+**Concurrency:** workflow-level group on `main` (`cancel-in-progress: false`) is
+the **primary** serialization of a full run (CI through smoke). A newer pending
+main run can replace an older pending one — not every commit is necessarily
+deployed. Serializing whole main runs delays CI as well as CD; accepted at
+current scale. Job-level `cd-production` on migrate / deploy-* / smoke-test is
+limited defense in depth (no overlapping individual production jobs); it cannot
+keep sequences uninterrupted if workflow-level serialization is removed. Deploy
+CLI success ≠ verified serving — smoke is the verification gate.
 
 Azure login uses OIDC (`azure/login`) with:
 
