@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
+from app.schemas.diary import PublishedReviewRead
 from app.schemas.pagination import Page
 from app.schemas.production import (
     ProductionCreate,
@@ -14,6 +15,7 @@ from app.schemas.production import (
     ProductionSummary,
     ProductionUpdate,
 )
+from app.services import diary as diary_service
 from app.services import production as production_service
 
 router = APIRouter(prefix="/api/v1/productions", tags=["productions"])
@@ -95,6 +97,31 @@ async def get_production_by_slug(
     except production_service.ProductionNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Production not found") from exc
     return ProductionRead.model_validate(production)
+
+
+@router.get(
+    "/{production_id}/reviews",
+    response_model=Page[PublishedReviewRead],
+    summary="List published reviews for a production",
+)
+async def list_production_reviews(
+    production_id: uuid.UUID,
+    limit: int = Query(diary_service.DEFAULT_LIMIT, ge=1, le=diary_service.MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db),
+) -> Page[PublishedReviewRead]:
+    try:
+        entries, total = await diary_service.list_published_reviews_for_production(
+            session, production_id, limit=limit, offset=offset
+        )
+    except production_service.ProductionNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Production not found") from exc
+    return Page[PublishedReviewRead](
+        items=[PublishedReviewRead.from_model(entry) for entry in entries],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get(

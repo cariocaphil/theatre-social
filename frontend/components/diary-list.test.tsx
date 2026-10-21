@@ -48,6 +48,7 @@ function makeEntry(overrides: Partial<DiaryEntry> = {}): DiaryEntry {
     watched_at: "2026-08-08",
     rating: null,
     review: null,
+    published_at: null,
     created_at: "2026-08-08T00:00:00Z",
     updated_at: "2026-08-08T00:00:00Z",
     ...overrides,

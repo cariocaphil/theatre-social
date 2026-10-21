@@ -34,6 +34,7 @@ function makeEntry(overrides: Partial<DiaryEntry> = {}): DiaryEntry {
     watched_at: "2026-08-08",
     rating: null,
     review: null,
+    published_at: null,
     created_at: "2026-08-08T00:00:00Z",
     updated_at: "2026-08-08T00:00:00Z",
     ...overrides,
@@ -59,7 +60,13 @@ describe("LogDialog", () => {
     expect(screen.getByText("Hamlet")).toBeInTheDocument();
 
     const dateInput = screen.getByLabelText("Date attended") as HTMLInputElement;
-    const today = new Date().toISOString().slice(0, 10);
+    // Match LogDialog's local-calendar today (not UTC ISO), avoiding TZ flakes.
+    const now = new Date();
+    const today = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    ].join("-");
     expect(dateInput.value).toBe(today);
   });
 
@@ -131,7 +138,132 @@ describe("LogDialog", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(capturedBody).not.toBeNull());
-    expect(capturedBody).toMatchObject({ rating: 4.5, review: "A remarkable production." });
+    expect(capturedBody).toMatchObject({
+      rating: 4.5,
+      review: "A remarkable production.",
+      publish_review: false,
+    });
+  });
+
+  it("hides publication controls until review text is entered", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <LogDialog
+        productionId="11111111-1111-1111-1111-111111111111"
+        productionTitle="Hamlet"
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Review visibility")).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Review (optional)"), "Worth seeing.");
+    expect(screen.getByText("Review visibility")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Keep review private" })).toBeChecked();
+  });
+
+  it("publishes atomically when Publish review is selected", async () => {
+    const user = userEvent.setup();
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        capturedBody = init?.body ? JSON.parse(init.body as string) : null;
+        return jsonResponse(
+          makeEntry({
+            review: "Worth seeing.",
+            published_at: "2026-08-08T12:00:00Z",
+          }),
+        );
+      }),
+    );
+
+    render(
+      <LogDialog
+        productionId="11111111-1111-1111-1111-111111111111"
+        productionTitle="Hamlet"
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("Review (optional)"), "Worth seeing.");
+    await user.click(screen.getByRole("radio", { name: "Publish review" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(capturedBody).not.toBeNull());
+    expect(capturedBody).toMatchObject({
+      review: "Worth seeing.",
+      publish_review: true,
+    });
+  });
+
+  it("preserves publication by default when editing a published review", async () => {
+    const user = userEvent.setup();
+    const existing = makeEntry({
+      review: "Published thoughts.",
+      published_at: "2026-08-01T00:00:00Z",
+    });
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        capturedBody = init?.body ? JSON.parse(init.body as string) : null;
+        return jsonResponse(existing);
+      }),
+    );
+
+    render(
+      <LogDialog
+        productionId={existing.production_id}
+        productionTitle="Hamlet"
+        entry={existing}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("This review is currently published.")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Keep review published" })).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(capturedBody).not.toBeNull());
+    expect(capturedBody).toMatchObject({ publish_review: true });
+  });
+
+  it("can explicitly unpublish when editing a published review", async () => {
+    const user = userEvent.setup();
+    const existing = makeEntry({
+      review: "Published thoughts.",
+      published_at: "2026-08-01T00:00:00Z",
+    });
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        capturedBody = init?.body ? JSON.parse(init.body as string) : null;
+        return jsonResponse({ ...existing, published_at: null });
+      }),
+    );
+
+    render(
+      <LogDialog
+        productionId={existing.production_id}
+        productionTitle="Hamlet"
+        entry={existing}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("radio", { name: "Unpublish review (make private)" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(capturedBody).not.toBeNull());
+    expect(capturedBody).toMatchObject({ publish_review: false });
   });
 
   it("prevents duplicate submission while a request is pending", async () => {

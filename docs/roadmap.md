@@ -129,6 +129,12 @@ changing product features.
   is limited defense in depth. Pending main runs can still be replaced (not every
   commit necessarily deploys).
 
+**Related (product):** review-text publication on diary entries
+(`feature/11-production-reviews` / PR 11) — `published_at`, publish/unpublish
+APIs, public `GET …/productions/{id}/reviews`, LogDialog visibility controls.
+Production-page public reviews UI and profiles remain separate follow-ups
+(see Phase 11). Mark this Done in Completed milestones once the PR merges.
+
 **Still proposed:**
 
 - Tighten Postgres network exposure (replace “allow all” firewall if still in

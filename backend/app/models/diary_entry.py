@@ -8,10 +8,10 @@ attendance is its own row, so there is deliberately no unique constraint on
 """
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, SmallInteger, Text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, SmallInteger, Text
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,7 @@ from app.db.base import UUIDAuditBase
 
 if TYPE_CHECKING:
     from app.models.production import Production
+    from app.models.user import User
 
 
 class DiaryEntry(UUIDAuditBase):
@@ -72,8 +73,14 @@ class DiaryEntry(UUIDAuditBase):
     # column length, for its limit.
     review: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # When set, `review` is publicly readable via production review list
+    # endpoints. Null means review text stays private to the owner diary API.
+    # Attendance (`watched_at`) and ratings are independent of this flag.
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Not eager by default, same rationale as Session.user: callers that
     # need the Production must opt in via `.options(joinedload(...))` (see
     # app/services/diary.py), so the eager-load strategy stays visible at
     # each call site.
     production: Mapped["Production"] = relationship()
+    user: Mapped["User"] = relationship()

@@ -156,6 +156,7 @@ erDiagram
     date watched_at
     smallint rating
     text review
+    datetime published_at
   }
 ```
 
@@ -166,6 +167,11 @@ erDiagram
   optional strings on the same row — Work/Venue/Person tables do not exist yet.
 - **DiaryEntry** is an attendance record, not a unique “user × production”
   rating. There is no unique constraint on `(user_id, production_id)`.
+- **Review publication:** optional `published_at` on `DiaryEntry`. Null =
+  review text private (owner diary API only). Non-null = review text listed on
+  `GET /api/v1/productions/{id}/reviews`. Publishing requires non-empty review
+  text; `watched_at` remains required; ratings are independent of publication.
+  See [ADR 0001](decisions/0001-reviews-as-published-diary-entries.md).
 - **Cascade asymmetry:** deleting a User cascades to Sessions and DiaryEntries;
   deleting a Production that still has diary rows is **restricted** (API returns
   `409 Conflict`).
@@ -173,7 +179,8 @@ erDiagram
   `app/core/ratings.py`.
 
 Migrations: `0001_initial` → `0002_create_productions_table` →
-`0003_create_users_and_sessions_tables` → `0004_create_diary_entries_table`.
+`0003_create_users_and_sessions_tables` → `0004_create_diary_entries_table` →
+`0005_add_diary_entry_published_at`.
 
 ## 7. Authentication, sessions, and authorization
 
@@ -181,6 +188,8 @@ Migrations: `0001_initial` → `0002_create_productions_table` →
 - Cookie holds an opaque token; DB stores `SHA-256(token)`.
 - Passwords hashed with Argon2id (`pwdlib`).
 - `GET /api/v1/auth/me` and diary routes require `get_current_user`.
+- Diary owner routes: `POST /api/v1/diary/{id}/publish` and `…/unpublish`.
+  Public: `GET /api/v1/productions/{id}/reviews` (published review text only).
 - Cookie flags derive from `ENVIRONMENT`:
   - development: `Secure=false`, `SameSite=Lax`
   - otherwise: `Secure=true`, `SameSite=None` (required when frontend and

@@ -22,6 +22,10 @@ from app.services.production import ProductionNotFoundError
 router = APIRouter(prefix="/api/v1/diary", tags=["diary"])
 
 
+def _map_publish_error(exc: diary_service.ReviewPublishError) -> HTTPException:
+    return HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @router.get("", response_model=Page[DiaryEntryRead], summary="List the current user's diary")
 async def list_diary_entries(
     limit: int = Query(diary_service.DEFAULT_LIMIT, ge=1, le=diary_service.MAX_LIMIT),
@@ -55,6 +59,8 @@ async def create_diary_entry(
         entry = await diary_service.create_diary_entry(session, current_user.id, payload)
     except ProductionNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Production not found") from exc
+    except diary_service.ReviewPublishError as exc:
+        raise _map_publish_error(exc) from exc
     return DiaryEntryRead.from_model(entry)
 
 
@@ -80,6 +86,44 @@ async def patch_diary_entry(
 ) -> DiaryEntryRead:
     try:
         entry = await diary_service.update_diary_entry(session, entry_id, current_user.id, payload)
+    except diary_service.DiaryEntryNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Diary entry not found") from exc
+    except diary_service.ReviewPublishError as exc:
+        raise _map_publish_error(exc) from exc
+    return DiaryEntryRead.from_model(entry)
+
+
+@router.post(
+    "/{entry_id}/publish",
+    response_model=DiaryEntryRead,
+    summary="Publish this entry's review text",
+)
+async def publish_diary_entry(
+    entry_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> DiaryEntryRead:
+    try:
+        entry = await diary_service.publish_diary_entry(session, entry_id, current_user.id)
+    except diary_service.DiaryEntryNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Diary entry not found") from exc
+    except diary_service.ReviewPublishError as exc:
+        raise _map_publish_error(exc) from exc
+    return DiaryEntryRead.from_model(entry)
+
+
+@router.post(
+    "/{entry_id}/unpublish",
+    response_model=DiaryEntryRead,
+    summary="Unpublish this entry's review text",
+)
+async def unpublish_diary_entry(
+    entry_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> DiaryEntryRead:
+    try:
+        entry = await diary_service.unpublish_diary_entry(session, entry_id, current_user.id)
     except diary_service.DiaryEntryNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Diary entry not found") from exc
     return DiaryEntryRead.from_model(entry)

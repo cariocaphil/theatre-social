@@ -69,12 +69,16 @@ class DiaryEntryCreate(BaseModel):
     body. `production_id` is required and immutable after creation --
     logging the wrong production means creating a new, correct entry, not
     reassigning an existing one.
+
+    `publish_review` publishes review text in the same transaction as create
+    when true (requires non-empty review). Default private.
     """
 
     production_id: uuid.UUID
     watched_at: date
     rating: float | None = None
     review: str | None = None
+    publish_review: bool = False
 
     @field_validator("watched_at")
     @classmethod
@@ -107,11 +111,17 @@ class DiaryEntryUpdate(BaseModel):
     same rule as `title`/`slug` on `ProductionUpdate`. There is no
     `production_id` field at all: the production a log refers to is
     immutable after creation.
+
+    `publish_review` when set: true publishes (or keeps published without
+    resetting `published_at`); false unpublishes. Omitted leaves publication
+    state unchanged (except clearing review text on a published entry is
+    rejected in the service layer).
     """
 
     watched_at: date | None = None
     rating: float | None = None
     review: str | None = None
+    publish_review: bool | None = None
 
     @field_validator("watched_at")
     @classmethod
@@ -158,6 +168,7 @@ class DiaryEntryRead(BaseModel):
     watched_at: date
     rating: float | None
     review: str | None
+    published_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -170,6 +181,35 @@ class DiaryEntryRead(BaseModel):
             watched_at=entry.watched_at,
             rating=from_half_stars(entry.rating),
             review=entry.review,
+            published_at=entry.published_at,
             created_at=entry.created_at,
             updated_at=entry.updated_at,
+        )
+
+
+class PublishedReviewRead(BaseModel):
+    """Public representation of a published diary review (no private fields)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    production_id: uuid.UUID
+    author_username: str
+    review: str
+    rating: float | None
+    watched_at: date
+    published_at: datetime
+
+    @classmethod
+    def from_model(cls, entry: DiaryEntry) -> "PublishedReviewRead":
+        if entry.published_at is None or not entry.review:
+            raise ValueError("entry is not a published review")
+        return cls(
+            id=entry.id,
+            production_id=entry.production_id,
+            author_username=entry.user.username,
+            review=entry.review,
+            rating=from_half_stars(entry.rating),
+            watched_at=entry.watched_at,
+            published_at=entry.published_at,
         )

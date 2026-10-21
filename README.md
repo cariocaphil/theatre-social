@@ -546,9 +546,11 @@ Production = the thing that was seen
 DiaryEntry = this user's record of seeing it (attendance + optional rating/review)
 ```
 
-There are still no likes, comments, follows, activity feeds, public diary pages,
-aggregate/average ratings, tags, lists, or viewing statistics — those are
-explicitly out of scope until a later phase needs them.
+Review text can be published from the log dialog (`published_at`); public
+`GET /api/v1/productions/{id}/reviews` returns published reviews. There is
+still no production-page reviews UI, likes, comments, follows, activity feeds,
+public diary/profile pages, aggregate ratings, tags, lists, or viewing
+statistics — those remain later work.
 
 ### Data model
 
@@ -579,11 +581,14 @@ explicitly out of scope until a later phase needs them.
 
 | Method | Path                     | Behavior                                                       |
 |--------|--------------------------|------------------------------------------------------------------|
-| POST   | `/api/v1/diary`          | Create a diary entry for the current user (`404` if the Production doesn't exist) |
+| POST   | `/api/v1/diary`          | Create a diary entry for the current user (`404` if the Production doesn't exist); optional `publish_review` |
 | GET    | `/api/v1/diary`          | List the current user's diary, paginated, `watched_at DESC, created_at DESC, id DESC` |
 | GET    | `/api/v1/diary/{id}`     | Get one of the current user's diary entries                     |
-| PATCH  | `/api/v1/diary/{id}`     | Partially update `watched_at`/`rating`/`review` (`production_id` is immutable) |
+| PATCH  | `/api/v1/diary/{id}`     | Partially update `watched_at`/`rating`/`review`/`publish_review` (`production_id` is immutable) |
+| POST   | `/api/v1/diary/{id}/publish` | Publish this entry's review text (requires non-empty review; owner only) |
+| POST   | `/api/v1/diary/{id}/unpublish` | Unpublish review text (owner only) |
 | DELETE | `/api/v1/diary/{id}`     | Delete one of the current user's diary entries                  |
+| GET    | `/api/v1/productions/{id}/reviews` | Public paginated list of published reviews for a production |
 
 All five require authentication (the same `get_current_user` session dependency
 introduced in Phase 4) and derive `user_id` from the session — never from the
@@ -655,9 +660,11 @@ curl -i -b cookies.txt -X PATCH http://localhost:8000/api/v1/diary/<entry-uuid> 
 ### Known limitations
 
 - No aggregate/average ratings anywhere (Production catalogue or diary) — each
-  `DiaryEntry` is only ever shown in the context of its own user.
+  `DiaryEntry` is only ever shown in the context of its own user (except
+  published review text on the public reviews API).
 - No pagination controls in the `/diary` UI yet — the API supports
   `limit`/`offset`, but the frontend always requests the first page.
+- No production-detail UI for browsing published reviews yet (API only).
 - No spoiler handling, rich text, or review-length enforcement in the frontend
   beyond a `maxLength` attribute and a character counter — the backend's 4000
   character limit (`MAX_REVIEW_LENGTH` in `app/schemas/diary.py`) is

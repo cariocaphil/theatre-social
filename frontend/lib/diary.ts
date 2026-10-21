@@ -19,6 +19,7 @@ export interface DiaryEntry {
   watched_at: string;
   rating: number | null;
   review: string | null;
+  published_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -35,12 +36,19 @@ export interface DiaryEntryCreateInput {
   watched_at: string;
   rating?: number | null;
   review?: string | null;
+  /** When true, publish review text in the same request as create. */
+  publish_review?: boolean;
 }
 
 export interface DiaryEntryUpdateInput {
   watched_at?: string;
   rating?: number | null;
   review?: string | null;
+  /**
+   * true = publish (or keep published); false = unpublish;
+   * omit = leave publication state unchanged.
+   */
+  publish_review?: boolean;
 }
 
 export type DiaryListResult =
